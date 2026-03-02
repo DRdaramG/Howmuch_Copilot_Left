@@ -17,7 +17,7 @@ import os
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 from typing import Optional
 
 import pystray
@@ -119,6 +119,64 @@ def _set_autostart(enabled: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Custom dialog (supports Ctrl+C / Ctrl+V in pystray callbacks)
+# ---------------------------------------------------------------------------
+
+def _ask_string(title: str, prompt: str) -> Optional[str]:
+    """Show an input dialog that reliably supports clipboard shortcuts.
+
+    ``simpledialog.askstring`` may lose Ctrl-C / Ctrl-V bindings when
+    called from a *pystray* callback thread on Windows.  This lightweight
+    replacement explicitly binds the standard clipboard virtual events so
+    that copy, paste, cut and select-all always work.
+    """
+
+    result: list[Optional[str]] = [None]
+
+    root = tk.Tk()
+    root.title(title)
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+
+    tk.Label(root, text=prompt).pack(padx=20, pady=(20, 5))
+
+    entry = tk.Entry(root, width=50)
+    entry.pack(padx=20, pady=5)
+    entry.focus_set()
+
+    # Explicitly bind clipboard / selection shortcuts
+    entry.bind("<Control-v>", lambda e: (e.widget.event_generate("<<Paste>>"), "break")[-1])
+    entry.bind("<Control-V>", lambda e: (e.widget.event_generate("<<Paste>>"), "break")[-1])
+    entry.bind("<Control-c>", lambda e: (e.widget.event_generate("<<Copy>>"), "break")[-1])
+    entry.bind("<Control-C>", lambda e: (e.widget.event_generate("<<Copy>>"), "break")[-1])
+    entry.bind("<Control-x>", lambda e: (e.widget.event_generate("<<Cut>>"), "break")[-1])
+    entry.bind("<Control-X>", lambda e: (e.widget.event_generate("<<Cut>>"), "break")[-1])
+    entry.bind("<Control-a>", lambda e: (e.widget.select_range(0, tk.END), "break"))
+    entry.bind("<Control-A>", lambda e: (e.widget.select_range(0, tk.END), "break"))
+
+    def _on_ok(_event: object = None) -> None:
+        result[0] = entry.get()
+        root.destroy()
+
+    def _on_cancel(_event: object = None) -> None:
+        root.destroy()
+
+    btn_frame = tk.Frame(root)
+    btn_frame.pack(pady=(5, 20))
+    tk.Button(btn_frame, text="OK", command=_on_ok, width=10).pack(side=tk.LEFT, padx=5)
+    tk.Button(btn_frame, text="Cancel", command=_on_cancel, width=10).pack(side=tk.LEFT, padx=5)
+
+    entry.bind("<Return>", _on_ok)
+    root.bind("<Escape>", _on_cancel)
+    root.protocol("WM_DELETE_WINDOW", _on_cancel)
+
+    root.grab_set()
+    root.mainloop()
+
+    return result[0]
+
+
+# ---------------------------------------------------------------------------
 # Main application class
 # ---------------------------------------------------------------------------
 
@@ -182,14 +240,10 @@ class CopilotTrayApp:
     def _on_set_api_key(
         self, _icon: pystray.Icon, _item: pystray.MenuItem
     ) -> None:
-        root = tk.Tk()
-        root.withdraw()
-        key = simpledialog.askstring(
+        key = _ask_string(
             "Set API Key",
             "Enter your GitHub Copilot token (starts with gho_):",
-            parent=root,
         )
-        root.destroy()
 
         if key is None:
             return  # user cancelled
