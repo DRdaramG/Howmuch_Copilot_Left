@@ -1,0 +1,271 @@
+"""Windows 11 taskbar tray widget that displays GitHub Copilot quota.
+
+Usage
+-----
+Run directly with Python::
+
+    python main.py
+
+Or as a compiled executable built with PyInstaller (see ``build.spec``).
+
+The first time you run the app, right-click the tray icon and choose
+**Set API Key** to enter your GitHub OAuth token (``gho_...``).
+"""
+
+import logging
+import os
+import sys
+import threading
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+from typing import Optional
+
+import pystray
+from PIL import Image, ImageDraw, ImageFont
+
+import api
+import config as cfg_module
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+APP_NAME = cfg_module.APP_NAME
+UPDATE_INTERVAL = 300  # seconds between automatic refreshes
+ICON_SIZE = (64, 64)
+
+# Windows registry key for startup programs
+_STARTUP_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+
+
+# ---------------------------------------------------------------------------
+# Icon helpers
+# ---------------------------------------------------------------------------
+
+def _make_icon(text: str) -> Image.Image:
+    """Render *text* onto a small RGBA image suitable as a tray icon."""
+    img = Image.new("RGBA", ICON_SIZE, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Try Windows system font; fall back to built-in bitmap font
+    font: ImageFont.ImageFont | ImageFont.FreeTypeFont
+    for font_name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"):
+        try:
+            font = ImageFont.truetype(font_name, 11)
+            break
+        except (IOError, OSError):
+            pass
+    else:
+        font = ImageFont.load_default()
+
+    # Centre the text inside the icon
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = max(0, (ICON_SIZE[0] - tw) // 2)
+    y = max(0, (ICON_SIZE[1] - th) // 2)
+    draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
+    return img
+
+
+def _make_placeholder_icon() -> Image.Image:
+    """Solid blue square used before the first quota fetch completes."""
+    img = Image.new("RGBA", ICON_SIZE, (0, 120, 212, 255))
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Auto-start (Windows registry)
+# ---------------------------------------------------------------------------
+
+def _set_autostart(enabled: bool) -> None:
+    """Enable or disable launching this app on Windows login."""
+    # Only attempt on Windows
+    if sys.platform != "win32":
+        logger.info("Auto-start is only supported on Windows.")
+        return
+    try:
+        import winreg  # pylint: disable=import-outside-toplevel
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            _STARTUP_KEY,
+            0,
+            winreg.KEY_SET_VALUE,
+        )
+        if enabled:
+            exe = sys.executable
+            script = os.path.abspath(__file__)
+            winreg.SetValueEx(
+                key, APP_NAME, 0, winreg.REG_SZ, f'"{exe}" "{script}"'
+            )
+            logger.info("Auto-start enabled.")
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+                logger.info("Auto-start disabled.")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to update registry for auto-start: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Main application class
+# ---------------------------------------------------------------------------
+
+class CopilotTrayApp:
+    """System-tray application that periodically shows Copilot quota."""
+
+    def __init__(self) -> None:
+        self._config = cfg_module.load()
+        self._quota_text: str = "..."
+        self._icon: Optional[pystray.Icon] = None
+        self._running = False
+        self._stop_event = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Quota helpers
+    # ------------------------------------------------------------------
+
+    def _quota_display(self) -> str:
+        return self._quota_text
+
+    def _tooltip(self) -> str:
+        return f"Copilot Left  {self._quota_text}"
+
+    def _refresh_icon(self) -> None:
+        if self._icon is not None:
+            self._icon.icon = _make_icon(self._quota_text)
+            self._icon.title = self._tooltip()
+
+    def _do_update(self) -> None:
+        """Fetch quota and update the tray icon."""
+        key = self._config.get("api_key", "")
+        if not key:
+            self._quota_text = "No key"
+        else:
+            used, total = api.fetch_quota(key)
+            if used is not None and total is not None:
+                # Format: omit decimals when usage is a whole number
+                used_str = f"{used:.1f}" if used != int(used) else str(int(used))
+                self._quota_text = f"{used_str}/{total}"
+            else:
+                self._quota_text = "Error"
+        self._refresh_icon()
+
+    def _update_loop(self) -> None:
+        """Background thread: fetch quota, then wait UPDATE_INTERVAL seconds."""
+        while not self._stop_event.is_set():
+            try:
+                self._do_update()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("Unexpected error in update loop: %s", exc)
+            # Block until the interval elapses or the stop event is signalled
+            self._stop_event.wait(timeout=UPDATE_INTERVAL)
+
+    # ------------------------------------------------------------------
+    # Menu callbacks
+    # ------------------------------------------------------------------
+
+    def _on_refresh(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        threading.Thread(target=self._do_update, daemon=True).start()
+
+    def _on_set_api_key(
+        self, _icon: pystray.Icon, _item: pystray.MenuItem
+    ) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        key = simpledialog.askstring(
+            "Set API Key",
+            "Enter your GitHub Copilot token (starts with gho_):",
+            parent=root,
+        )
+        root.destroy()
+
+        if key is None:
+            return  # user cancelled
+        key = key.strip()
+        if not key.startswith("gho_"):
+            root2 = tk.Tk()
+            root2.withdraw()
+            messagebox.showerror(
+                "Invalid Token",
+                "The token must start with 'gho_'.\nPlease try again.",
+                parent=root2,
+            )
+            root2.destroy()
+            return
+
+        self._config["api_key"] = key
+        cfg_module.save(self._config)
+        threading.Thread(target=self._do_update, daemon=True).start()
+
+    def _on_toggle_autostart(
+        self, _icon: pystray.Icon, _item: pystray.MenuItem
+    ) -> None:
+        self._config["auto_start"] = not self._config.get("auto_start", False)
+        cfg_module.save(self._config)
+        _set_autostart(self._config["auto_start"])
+
+    def _autostart_checked(self, _item: pystray.MenuItem) -> bool:
+        return bool(self._config.get("auto_start", False))
+
+    def _on_quit(self, icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        self._running = False
+        self._stop_event.set()
+        icon.stop()
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        """Build the tray icon and enter the pystray event loop."""
+        self._running = True
+
+        update_thread = threading.Thread(
+            target=self._update_loop, daemon=True, name="quota-updater"
+        )
+        update_thread.start()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Refresh Now", self._on_refresh),
+            pystray.MenuItem("Set API Key", self._on_set_api_key),
+            pystray.MenuItem(
+                "Start with Windows",
+                self._on_toggle_autostart,
+                checked=self._autostart_checked,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._on_quit),
+        )
+
+        self._icon = pystray.Icon(
+            APP_NAME,
+            _make_placeholder_icon(),
+            self._tooltip(),
+            menu,
+        )
+        self._icon.run()
+
+
+# ---------------------------------------------------------------------------
+# Entry-point guard
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    app = CopilotTrayApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

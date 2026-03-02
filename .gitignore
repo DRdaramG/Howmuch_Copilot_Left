@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.spec.pyc
+
+# PyInstaller output
+dist/
+build/
+
+# Installer output
+Output/
+
+# Runtime config (user-specific, contains API key)
+CopilotLeft/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
