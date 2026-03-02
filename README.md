@@ -1,7 +1,7 @@
 # Howmuch Copilot Left
 
-Windows 11 작업 표시줄 트레이 위젯으로 GitHub Copilot 할당량을 5분마다 자동 표시합니다.
-예: `172.7/1500`
+Windows 11 ?�업 ?�시�??�레???�젯?�로 GitHub Copilot ?�당?�을 5분마???�동 ?�시?�니??
+?? `172.7/1500`
 
 > **A Windows 11 system-tray widget that automatically reads and displays your GitHub Copilot quota every 5 minutes.**  
 > Example display: `172.7/1500`
@@ -10,95 +10,95 @@ Windows 11 작업 표시줄 트레이 위젯으로 GitHub Copilot 할당량을 5
 
 ## 기능 / Features
 
-| 기능 | 설명 |
+| 기능 | ?�명 |
 |------|------|
-| 자동 갱신 | 5분마다 Copilot 할당량을 자동으로 읽어와 트레이 아이콘에 표시 |
-| 간편 인증 | `gho_` 로 시작하는 GitHub OAuth 토큰 한 번만 입력 |
-| 시작 프로그램 | 우클릭 메뉴에서 Windows 로그인 시 자동 실행 설정 |
-| 즉시 새로고침 | 우클릭 메뉴에서 즉시 할당량 갱신 가능 |
-| 설치 프로그램 | Inno Setup 기반 Windows 설치 파일 제공 |
+| ?�동 갱신 | 5분마??Copilot ?�당?�을 ?�동?�로 ?�어?� ?�레???�이콘에 ?�시 |
+| 간편 ?�증 | `gho_` �??�작?�는 GitHub OAuth ?�큰 ??번만 ?�력 |
+| ?�작 ?�로그램 | ?�클�?메뉴?�서 Windows 로그?????�동 ?�행 ?�정 |
+| 즉시 ?�로고침 | ?�클�?메뉴?�서 즉시 ?�당??갱신 가??|
+| ?�치 ?�로그램 | 
 
 ---
 
-## 스크린샷 / Screenshot
+## ?�크린샷 / Screenshot
 
-트레이 아이콘에 **현재사용/최대** 형식으로 표시됩니다.
+?�레???�이콘에 **?�재?�용/최�?** ?�식?�로 ?�시?�니??
 
 ```
-[시스템 트레이] ... 172.7/1500  ← 툴팁: "Copilot Left  172.7/1500"
+[?�스???�레?? ... 172.7/1500  ???�팁: "Copilot Left  172.7/1500"
 ```
 
 ---
 
-## 시작하기 / Getting Started
+## ?�작?�기 / Getting Started
 
-### 1. GitHub OAuth 토큰 발급
+### 1. GitHub OAuth ?�큰 발급
 
-1. GitHub → **Settings** → **Developer settings** → **Personal access tokens** → **Tokens (classic)**
-2. **Generate new token** 클릭 후 `copilot` 스코프 선택
-3. 생성된 토큰(`gho_...`) 을 복사
+1. GitHub ??**Settings** ??**Developer settings** ??**Personal access tokens** ??**Tokens (classic)**
+2. **Generate new token** ?�릭 ??`copilot` ?�코???�택
+3. ?�성???�큰(`gho_...`) ??복사
 
-또는 [GitHub Copilot VS Code 확장](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot)이 이미 설치된 경우, 확장이 보관하는 토큰을 사용할 수 있습니다.
+?�는 [GitHub Copilot VS Code ?�장](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot)???��? ?�치??경우, ?�장??보�??�는 ?�큰???�용?????�습?�다.
 
-### 2. 설치 프로그램으로 설치 (권장)
+### 2. ?�치 ?�로그램?�로 ?�치 (권장)
 
-> 빌드된 설치 프로그램이 릴리스 페이지에 있는 경우 다운로드하여 실행하세요.
+> 빌드???�치 ?�로그램??릴리???�이지???�는 경우 ?�운로드?�여 ?�행?�세??
 
 ```
 CopilotLeft-Setup-1.0.0.exe
 ```
 
-### 3. Python으로 직접 실행
+### 3. Python?�로 직접 ?�행
 
 ```bash
-# 의존성 설치
+# ?�존???�치
 pip install -r requirements.txt
 
-# 실행
+# ?�행
 python main.py
 ```
 
-앱이 실행되면 트레이에 아이콘이 표시됩니다. **우클릭 → Set API Key** 에서 토큰을 입력하세요.
+?�이 ?�행?�면 ?�레?�에 ?�이콘이 ?�시?�니?? **?�클�???Set API Key** ?�서 ?�큰???�력?�세??
 
 ---
 
 ## 빌드 / Build
 
-### 실행 파일 생성 (PyInstaller)
+### ?�행 ?�일 ?�성 (PyInstaller)
 
 ```bash
 pip install pyinstaller
 pyinstaller build.spec
-# 결과물: dist/CopilotLeft/CopilotLeft.exe
+# 결과�? dist/CopilotLeft/CopilotLeft.exe
 ```
 
-### 설치 프로그램 생성 (Inno Setup)
+### ?�치 ?�로그램 ?�성 (
 
-1. [Inno Setup 6](https://jrsoftware.org/isdl.php) 설치
-2. PyInstaller로 실행 파일 먼저 생성
-3. 아래 명령 실행:
+1. [
+2. PyInstaller�??�행 ?�일 먼�? ?�성
+3. ?�래 명령 ?�행:
 
 ```bat
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-# 결과물: Output\CopilotLeft-Setup-1.0.0.exe
+"C:\Program Files (x86)\
+# 결과�? Output\CopilotLeft-Setup-1.0.0.exe
 ```
 
 ---
 
-## 파일 구조 / File Structure
+## ?�일 구조 / File Structure
 
 ```
-├── main.py          # 메인 애플리케이션 (시스템 트레이 UI)
-├── api.py           # GitHub Copilot 할당량 API 조회
-├── config.py        # 설정 파일 관리 (%APPDATA%\CopilotLeft\config.json)
-├── requirements.txt # Python 의존성
-├── build.spec       # PyInstaller 빌드 설정
-└── installer.iss    # Inno Setup 설치 스크립트
+?��??� main.py          # 메인 ?�플리�??�션 (?�스???�레??UI)
+?��??� api.py           # GitHub Copilot ?�당??API 조회
+?��??� config.py        # ?�정 ?�일 관�?(%APPDATA%\CopilotLeft\config.json)
+?��??� requirements.txt # Python ?�존??
+?��??� build.spec       # PyInstaller 빌드 ?�정
+?��??� installer.iss    # 
 ```
 
 ---
 
-## 설정 파일 위치 / Config Location
+## ?�정 ?�일 ?�치 / Config Location
 
 ```
 %APPDATA%\CopilotLeft\config.json
@@ -106,22 +106,22 @@ pyinstaller build.spec
 
 ---
 
-## 의존성 / Dependencies
+## ?�존??/ Dependencies
 
-| 패키지 | 버전 | 용도 |
+| ?�키지 | 버전 | ?�도 |
 |--------|------|------|
-| `pystray` | 0.19.5 | Windows 시스템 트레이 아이콘 |
-| `Pillow` | 10.3.0 | 트레이 아이콘 이미지 생성 |
-| `requests` | 2.32.3 | HTTPS API 요청 |
+| `pystray` | 0.19.5 | Windows ?�스???�레???�이�?|
+| `Pillow` | 10.3.0 | ?�레???�이�??��?지 ?�성 |
+| `requests` | 2.32.3 | HTTPS API ?�청 |
 
 ---
 
-## 할당량 초기화 시간
+## ?�당??초기???�간
 
-한국 기준 **매월 1일 오전 9시** (UTC 00:00) 에 Copilot 할당량이 초기화됩니다.
+?�국 기�? **매월 1???�전 9??* (UTC 00:00) ??Copilot ?�당?�이 초기?�됩?�다.
 
 ---
 
-## 라이선스 / License
+## ?�이?�스 / License
 
 MIT
