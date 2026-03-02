@@ -151,8 +151,8 @@ def _ask_string(title: str, prompt: str) -> Optional[str]:
     entry.bind("<Control-C>", lambda e: (e.widget.event_generate("<<Copy>>"), "break")[-1])
     entry.bind("<Control-x>", lambda e: (e.widget.event_generate("<<Cut>>"), "break")[-1])
     entry.bind("<Control-X>", lambda e: (e.widget.event_generate("<<Cut>>"), "break")[-1])
-    entry.bind("<Control-a>", lambda e: (e.widget.select_range(0, tk.END), "break"))
-    entry.bind("<Control-A>", lambda e: (e.widget.select_range(0, tk.END), "break"))
+    entry.bind("<Control-a>", lambda e: (e.widget.select_range(0, tk.END), "break")[-1])
+    entry.bind("<Control-A>", lambda e: (e.widget.select_range(0, tk.END), "break")[-1])
 
     def _on_ok(_event: object = None) -> None:
         result[0] = entry.get()
