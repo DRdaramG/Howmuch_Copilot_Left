@@ -17,7 +17,6 @@ import os
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox
 from typing import Optional
 
 import pystray
@@ -41,6 +40,7 @@ logger = logging.getLogger(__name__)
 APP_NAME = cfg_module.APP_NAME
 UPDATE_INTERVAL = 300  # seconds between automatic refreshes
 ICON_SIZE = (64, 64)
+_DIALOG_FOCUS_DELAY_MS = 150  # ms to wait before grab_set; allows window to render
 
 # Windows registry key for startup programs
 _STARTUP_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
@@ -133,16 +133,17 @@ def _ask_string(title: str, prompt: str) -> Optional[str]:
 
     result: list[Optional[str]] = [None]
 
+    logger.debug("[_ask_string] Creating Tk root window (title=%r)", title)
     root = tk.Tk()
     root.title(title)
     root.attributes("-topmost", True)
     root.resizable(False, False)
 
+    logger.debug("[_ask_string] Building UI elements")
     tk.Label(root, text=prompt).pack(padx=20, pady=(20, 5))
 
     entry = tk.Entry(root, width=50)
     entry.pack(padx=20, pady=5)
-    entry.focus_set()
 
     # Explicitly bind clipboard / selection shortcuts
     entry.bind("<Control-v>", lambda e: (e.widget.event_generate("<<Paste>>"), "break")[-1])
@@ -156,9 +157,11 @@ def _ask_string(title: str, prompt: str) -> Optional[str]:
 
     def _on_ok(_event: object = None) -> None:
         result[0] = entry.get()
+        logger.debug("[_ask_string] OK pressed, value length=%d", len(result[0] or ""))
         root.destroy()
 
     def _on_cancel(_event: object = None) -> None:
+        logger.debug("[_ask_string] Cancel/close pressed")
         root.destroy()
 
     btn_frame = tk.Frame(root)
@@ -170,10 +173,73 @@ def _ask_string(title: str, prompt: str) -> Optional[str]:
     root.bind("<Escape>", _on_cancel)
     root.protocol("WM_DELETE_WINDOW", _on_cancel)
 
-    root.grab_set()
+    # Delay grab_set and focus until the window is fully rendered.
+    # Calling grab_set() immediately can block keyboard/mouse input when
+    # the dialog is created from a pystray callback thread on Windows.
+    def _delayed_focus() -> None:
+        logger.debug("[_ask_string] Running delayed focus / grab_set")
+        try:
+            root.lift()
+            root.focus_force()
+            entry.focus_set()
+            root.grab_set()
+            logger.debug("[_ask_string] grab_set succeeded")
+        except tk.TclError as exc:
+            logger.warning("[_ask_string] grab_set failed: %s", exc)
+
+    root.after(_DIALOG_FOCUS_DELAY_MS, _delayed_focus)
+
+    logger.debug("[_ask_string] Entering mainloop")
     root.mainloop()
+    logger.debug(
+        "[_ask_string] mainloop exited, result=%s",
+        "set" if result[0] is not None else "None",
+    )
 
     return result[0]
+
+
+def _show_error(title: str, message: str) -> None:
+    """Show a modal error dialog that is guaranteed to be closable.
+
+    ``messagebox.showerror`` can hang when invoked from a *pystray*
+    callback thread on Windows because the underlying Tk instance
+    has no running event loop.  This helper creates a self-contained
+    Tk window with its own ``mainloop`` so it always responds to
+    keyboard and mouse events.
+    """
+    logger.debug("[_show_error] Creating error dialog (title=%r)", title)
+    root = tk.Tk()
+    root.title(title)
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+
+    tk.Label(root, text=message, justify=tk.LEFT).pack(padx=20, pady=(20, 10))
+
+    def _on_ok(_event: object = None) -> None:
+        logger.debug("[_show_error] OK / close pressed")
+        root.destroy()
+
+    tk.Button(root, text="OK", command=_on_ok, width=10).pack(pady=(5, 20))
+    root.bind("<Return>", _on_ok)
+    root.bind("<Escape>", _on_ok)
+    root.protocol("WM_DELETE_WINDOW", _on_ok)
+
+    def _delayed_focus() -> None:
+        logger.debug("[_show_error] Running delayed focus / grab_set")
+        try:
+            root.lift()
+            root.focus_force()
+            root.grab_set()
+            logger.debug("[_show_error] grab_set succeeded")
+        except tk.TclError as exc:
+            logger.warning("[_show_error] grab_set failed: %s", exc)
+
+    root.after(_DIALOG_FOCUS_DELAY_MS, _delayed_focus)
+
+    logger.debug("[_show_error] Entering mainloop")
+    root.mainloop()
+    logger.debug("[_show_error] mainloop exited")
 
 
 # ---------------------------------------------------------------------------
@@ -240,25 +306,30 @@ class CopilotTrayApp:
     def _on_set_api_key(
         self, _icon: pystray.Icon, _item: pystray.MenuItem
     ) -> None:
+        logger.debug("[_on_set_api_key] Opening API key dialog")
         key = _ask_string(
             "Set API Key",
             "Enter your GitHub Copilot token (starts with gho_):",
         )
 
         if key is None:
-            return  # user cancelled
+            logger.debug("[_on_set_api_key] User cancelled the dialog")
+            return
         key = key.strip()
+        logger.debug(
+            "[_on_set_api_key] Key entered, length=%d, starts_with_gho=%s",
+            len(key),
+            key.startswith("gho_"),
+        )
         if not key.startswith("gho_"):
-            root2 = tk.Tk()
-            root2.withdraw()
-            messagebox.showerror(
+            logger.debug("[_on_set_api_key] Invalid key, showing error dialog")
+            _show_error(
                 "Invalid Token",
                 "The token must start with 'gho_'.\nPlease try again.",
-                parent=root2,
             )
-            root2.destroy()
             return
 
+        logger.debug("[_on_set_api_key] Saving key and triggering refresh")
         self._config["api_key"] = key
         cfg_module.save(self._config)
         threading.Thread(target=self._do_update, daemon=True).start()
