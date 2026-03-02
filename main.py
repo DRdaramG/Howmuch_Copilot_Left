@@ -33,6 +33,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -173,19 +174,22 @@ def _ask_string(title: str, prompt: str) -> Optional[str]:
     root.bind("<Escape>", _on_cancel)
     root.protocol("WM_DELETE_WINDOW", _on_cancel)
 
-    # Delay grab_set and focus until the window is fully rendered.
-    # Calling grab_set() immediately can block keyboard/mouse input when
-    # the dialog is created from a pystray callback thread on Windows.
+    # Delay focus until the window is fully rendered.
+    # NOTE: grab_set() is intentionally omitted here.  When the dialog is
+    # created from a pystray callback thread on Windows, grab_set() can
+    # intercept keyboard events at the platform level and prevent the
+    # Entry widget from receiving any typed or pasted input – even though
+    # the insertion cursor keeps blinking.  The window is already marked
+    # "-topmost", so it will stay in the foreground without a grab.
     def _delayed_focus() -> None:
-        logger.debug("[_ask_string] Running delayed focus / grab_set")
+        logger.debug("[_ask_string] Running delayed focus")
         try:
             root.lift()
             root.focus_force()
             entry.focus_set()
-            root.grab_set()
-            logger.debug("[_ask_string] grab_set succeeded")
+            logger.debug("[_ask_string] focus set succeeded")
         except tk.TclError as exc:
-            logger.warning("[_ask_string] grab_set failed: %s", exc)
+            logger.warning("[_ask_string] focus failed: %s", exc)
 
     root.after(_DIALOG_FOCUS_DELAY_MS, _delayed_focus)
 
