@@ -367,7 +367,12 @@ def fetch_ollama(settings: dict) -> QuotaResult:
             if not cookie:
                 raise
     if cookie:
-        windows, plan, error = _fetch_ollama_settings(str(cookie))
+        try:
+            windows, plan, error = _fetch_ollama_settings(str(cookie))
+        except requests.RequestException:
+            if api_windows:
+                return QuotaResult("Ollama", api_windows, plan=api_plan)
+            raise
         if windows:
             return QuotaResult("Ollama", windows, plan=plan or api_plan)
         if not api_windows:
@@ -434,36 +439,69 @@ def _parse_ollama_settings(document: str) -> tuple[list[QuotaWindow], str | None
     labels = (
         ("5h", ("5-hour", "5h", "Session", "Hourly")),
         ("weekly", ("Weekly",)),
+        ("monthly", ("Monthly",)),
     )
-    reset_times = re.findall(r'data-time=["\']([^"\']+)', text, re.IGNORECASE)
-    for index, (label, names) in enumerate(labels):
-        percent = None
+    all_names = tuple(name for _, names in labels for name in names)
+    for label, names in labels:
+        block = None
         for name in names:
-            patterns = (
-                rf'aria-label=["\']{re.escape(name)}\s+usage\s+([\d.]+)\s*%',
-                rf'{re.escape(name)}\s+usage[\s\S]{{0,400}}?([\d.]+)\s*%\s*used',
-                rf'{re.escape(name)}\s+usage[\s\S]{{0,400}}?width:\s*([\d.]+)%',
+            start = re.search(
+                rf'(?:aria-label=["\'])?{re.escape(name)}\s+usage',
+                text,
+                re.IGNORECASE,
             )
-            match = next(
-                (
-                    found
-                    for pattern in patterns
-                    if (found := re.search(pattern, text, re.IGNORECASE))
-                ),
-                None,
-            )
-            if match:
-                percent = match.group(1)
+            if start:
+                tail = text[start.start() :]
+                next_label = re.search(
+                    "|".join(
+                        rf"{re.escape(other)}\s+usage"
+                        for other in all_names
+                        if other != name
+                    ),
+                    tail[len(start.group(0)) :],
+                    re.IGNORECASE,
+                )
+                end = (
+                    len(start.group(0)) + next_label.start()
+                    if next_label
+                    else 1200
+                )
+                block = tail[:end]
                 break
+        if not block:
+            continue
+        percent_match = re.search(r"([\d.]+)\s*%\s*used", block, re.IGNORECASE)
+        if not percent_match:
+            percent_match = re.search(
+                r"usage\s+([\d.]+)\s*%", block, re.IGNORECASE
+            )
+        if not percent_match:
+            percent_match = re.search(r"width:\s*([\d.]+)%", block, re.IGNORECASE)
+        used = total = None
+        if label == "monthly":
+            amounts = re.search(
+                r"\$([\d,.]+)\s+of\s+\$([\d,.]+)(?:\s+used)?",
+                block,
+                re.IGNORECASE,
+            )
+            if amounts:
+                used = amounts.group(1).replace(",", "")
+                total = amounts.group(2).replace(",", "")
+        reset_match = re.search(
+            r'data-time=["\']([^"\']+)', block, re.IGNORECASE
+        )
         window = _window(
             label,
-            percent=percent,
-            reset=reset_times[index] if index < len(reset_times) else None,
+            used=used,
+            total=total,
+            percent=percent_match.group(1) if percent_match else None,
+            unit="USD" if used is not None else "",
+            reset=reset_match.group(1) if reset_match else None,
         )
         if window:
             windows.append(window)
     plan_match = re.search(
-        r"Cloud\s+Usage[\s\S]{0,300}?\b(Free|Pro|Max|Business)\b",
+        r"(?:Cloud|Included)\s+Usage[\s\S]{0,300}?\b(Free|Pro|Max|Business)\b",
         text,
         re.IGNORECASE,
     )

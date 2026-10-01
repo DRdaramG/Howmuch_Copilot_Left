@@ -170,6 +170,72 @@ class QuotaParsingTests(unittest.TestCase):
         )
 
     @patch.dict(
+        os.environ,
+        {"OLLAMA_SESSION_COOKIE": "__Secure-session=test"},
+        clear=True,
+    )
+    @patch("api.requests.get")
+    def test_ollama_settings_monthly_usage(self, get):
+        get.return_value.status_code = 200
+        get.return_value.is_redirect = False
+        get.return_value.text = """
+            <span>Included Usage</span><span>Max</span>
+            <section>Monthly usage
+              <span>$7.50 of $60 used</span>
+              <div style="width: 12.5%"></div>
+              <time data-time="2026-11-01T00:00:00Z"></time>
+            </section>
+        """
+
+        result = api.fetch_ollama({})
+
+        self.assertEqual(result.plan, "Max")
+        self.assertEqual(result.windows[0].label, "monthly")
+        self.assertEqual(result.windows[0].used_percent, 12.5)
+        self.assertEqual(result.windows[0].used, 7.5)
+        self.assertEqual(result.windows[0].total, 60)
+        self.assertEqual(result.windows[0].resets_at, "2026-11-01T00:00:00Z")
+
+    def test_ollama_settings_associates_reset_with_available_window(self):
+        windows, _ = api._parse_ollama_settings(
+            """
+            <time data-time="unrelated"></time>
+            <section>Weekly usage <span>67% used</span>
+              <time data-time="2026-10-04T13:00:00Z"></time>
+            </section>
+            """
+        )
+
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].label, "weekly")
+        self.assertEqual(windows[0].resets_at, "2026-10-04T13:00:00Z")
+
+    @patch.dict(
+        os.environ,
+        {
+            "OLLAMA_API_KEY": "test-token",
+            "OLLAMA_SESSION_COOKIE": "__Secure-session=test",
+        },
+        clear=True,
+    )
+    @patch(
+        "api.requests.get",
+        side_effect=api.requests.Timeout("settings timeout"),
+    )
+    @patch("api._request_json")
+    def test_ollama_cookie_failure_keeps_api_usage(self, request_json, _get):
+        request_json.side_effect = [
+            {"limits": {"weekly": {"usage": 0.4}}},
+            {"Plan": "pro"},
+        ]
+
+        result = api.fetch_ollama({})
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.windows[0].used_percent, 40)
+        self.assertEqual(result.plan, "pro")
+
+    @patch.dict(
         os.environ, {"ANTIGRAVITY_ACCESS_TOKEN": "test-token"}, clear=False
     )
     @patch("api._request_json")
