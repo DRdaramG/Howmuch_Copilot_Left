@@ -383,6 +383,10 @@ def _quota_windows(data: dict) -> list[QuotaWindow]:
             "percent_used",
             value.get("percentUsed", value.get("percent", value.get("utilization"))),
         )
+        if "utilization" in value:
+            utilization = _number(percent)
+            if utilization is not None and utilization <= 1:
+                percent = utilization * 100
         window = _window(
             label,
             used=value.get("used", value.get("usage")),
