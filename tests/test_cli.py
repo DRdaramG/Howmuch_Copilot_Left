@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import api
+import config
 import main
 
 
@@ -56,6 +57,56 @@ class QuotaParsingTests(unittest.TestCase):
 
         self.assertEqual([window.used_percent for window in result.windows], [30, 25])
 
+    @patch.dict(os.environ, {"OLLAMA_API_KEY": "test-token"}, clear=False)
+    @patch("api._request_json")
+    def test_ollama_cloud_plan_windows_and_resets(self, request_json):
+        request_json.return_value = {
+            "subscription": {"plan": "Pro"},
+            "windows": {
+                "five_hour": {
+                    "used": 25,
+                    "limit": 100,
+                    "resets_at": "2026-10-01T10:00:00Z",
+                },
+                "weekly": {"percent_used": 40, "reset_at": "next week"},
+            },
+        }
+
+        result = api.fetch_ollama({"url": "https://example.test/usage"})
+
+        self.assertEqual(result.plan, "Pro")
+        self.assertEqual([window.label for window in result.windows], ["5h", "weekly"])
+        self.assertEqual(result.windows[0].resets_at, "2026-10-01T10:00:00Z")
+
+    @patch.dict(
+        os.environ, {"ANTIGRAVITY_ACCESS_TOKEN": "test-token"}, clear=False
+    )
+    @patch("api._request_json")
+    def test_antigravity_quota_list(self, request_json):
+        request_json.return_value = {
+            "tier": "Ultra",
+            "quotas": [
+                {
+                    "name": "weekly",
+                    "remaining": 75,
+                    "total": 100,
+                    "next_reset": "Friday",
+                }
+            ],
+        }
+
+        result = api.fetch_antigravity({"url": "https://example.test/quota"})
+
+        self.assertEqual(result.plan, "Ultra")
+        self.assertEqual(result.windows[0].used_percent, 25)
+        self.assertEqual(result.windows[0].resets_at, "Friday")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_cloud_provider_requires_credentials(self):
+        result = api.fetch_ollama({})
+
+        self.assertEqual(result.error, "set OLLAMA_API_KEY")
+
     @patch("api.requests.post")
     def test_codex_refresh_rotates_and_secures_credentials(self, post):
         response = post.return_value
@@ -90,6 +141,30 @@ class RenderingTests(unittest.TestCase):
         output = main.render([api.QuotaResult("Claude", error="not logged in")])
         self.assertIn("Claude", output)
         self.assertIn("unavailable", output)
+
+    def test_plan_and_reset_are_rendered(self):
+        result = api.QuotaResult(
+            "Ollama",
+            [api.QuotaWindow("weekly", 10, resets_at="Friday")],
+            plan="Pro",
+        )
+
+        output = main.render([result])
+
+        self.assertIn("Ollama (Pro) weekly", output)
+        self.assertIn("resets Friday", output)
+
+
+class ConfigTests(unittest.TestCase):
+    @patch.dict(os.environ, {"EDITOR": "true"}, clear=False)
+    def test_edit_creates_private_default_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+
+            config.edit(path)
+
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertIn("antigravity", config.load(path)["providers"])
 
 
 if __name__ == "__main__":

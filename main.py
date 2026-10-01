@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import sys
+import termios
 import time
+import tty
 from dataclasses import asdict
 from datetime import datetime
 
@@ -25,14 +28,17 @@ def progress_bar(percent: float) -> str:
 def render(results: list[api.QuotaResult]) -> str:
     lines = [f"AI quota usage · {datetime.now().astimezone():%Y-%m-%d %H:%M:%S %Z}"]
     for result in results:
+        provider = result.provider
+        if result.plan:
+            provider += f" ({result.plan})"
         if result.error:
-            lines.append(f"{result.provider:<12} unavailable: {result.error}")
+            lines.append(f"{provider:<12} unavailable: {result.error}")
             continue
         if not result.windows:
-            lines.append(f"{result.provider:<12} no quota reported")
+            lines.append(f"{provider:<12} no quota reported")
             continue
         for window in result.windows:
-            label = f"{result.provider} {window.label}".strip()
+            label = f"{provider} {window.label}".strip()
             suffix = f"{progress_bar(window.used_percent)} ({window.used_percent:.0f}%)"
             if window.used is not None and window.total is not None:
                 suffix += f"  {window.used:g}/{window.total:g} {window.unit}".rstrip()
@@ -60,6 +66,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def wait_for_refresh(seconds: int) -> bool:
+    if not sys.stdin.isatty():
+        time.sleep(seconds)
+        return False
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    try:
+        tty.setcbreak(descriptor)
+        updated = termios.tcgetattr(descriptor)
+        updated[0] &= ~termios.IXON
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, updated)
+        ready, _, _ = select.select([sys.stdin], [], [], seconds)
+        return bool(ready and os.read(descriptor, 1) == b"\x13")
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     settings = config.load()
@@ -77,9 +100,16 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.once and not args.no_clear and sys.stdout.isatty():
                     print("\033[2J\033[H", end="")
                 print(render(results), flush=True)
+                if not args.once and sys.stdin.isatty():
+                    print("\nCtrl+S: settings", flush=True)
             if args.once or args.json:
                 return 0
-            time.sleep(interval)
+            if wait_for_refresh(interval):
+                config.edit()
+                settings = config.load()
+                interval = args.interval or int(
+                    settings.get("refresh_interval_seconds", 60)
+                )
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return 0
