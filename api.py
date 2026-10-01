@@ -282,6 +282,16 @@ def fetch_claude(settings: dict) -> QuotaResult:
                 "weekly_model": "7d model",
                 "weekly_scoped": "7d scoped",
             }.get(kind, str(kind))
+            identity = next(
+                (
+                    str(value[key])
+                    for key in ("model", "scope", "label", "name")
+                    if value.get(key)
+                ),
+                None,
+            )
+            if identity and kind in ("weekly_model", "weekly_scoped"):
+                label = f"7d {identity}"
             percent = _number(value.get("percent"))
             if label in labels or not percent:
                 continue

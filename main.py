@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import select
+import signal
 import sys
 import termios
 import time
@@ -44,7 +45,14 @@ def format_reset(value: str, local_timezone: tzinfo | None = None) -> str:
         except ValueError:
             return value
     else:
-        parsed = datetime.fromtimestamp(timestamp, tz=datetime.now().astimezone().tzinfo)
+        if abs(timestamp) >= 100_000_000_000:
+            timestamp /= 1000
+        try:
+            parsed = datetime.fromtimestamp(
+                timestamp, tz=datetime.now().astimezone().tzinfo
+            )
+        except (ValueError, OverflowError, OSError):
+            return value
     if parsed.tzinfo is None:
         parsed = parsed.astimezone()
     parsed = parsed.astimezone(local_timezone)
@@ -142,6 +150,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     if interactive:
         print("\033[?1049h", end="", flush=True)
+    previous_handlers = {}
+    if interactive:
+        def terminate(received: int, _frame: object) -> None:
+            raise SystemExit(128 + received)
+
+        for signal_number in (signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, terminate)
     try:
         while True:
             results = collect(settings)
@@ -165,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         print(file=sys.stderr)
         return 0
     finally:
+        for signal_number, handler in previous_handlers.items():
+            signal.signal(signal_number, handler)
         if interactive:
             print("\033[?1049l", end="", flush=True)
 

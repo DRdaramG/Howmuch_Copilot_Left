@@ -89,8 +89,11 @@ def _choose_provider(
     if not choice:
         return None
     try:
-        return providers[int(choice) - 1]
-    except (ValueError, IndexError):
+        index = int(choice)
+        if not 1 <= index <= len(providers):
+            raise ValueError
+        return providers[index - 1]
+    except ValueError:
         output_fn("잘못된 번호입니다.")
         return None
 

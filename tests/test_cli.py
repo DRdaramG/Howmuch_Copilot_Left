@@ -50,6 +50,22 @@ class QuotaParsingTests(unittest.TestCase):
             [window.label for window in result.windows], ["5h", "7d", "7d model"]
         )
 
+    @patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "test-token"}, clear=False)
+    @patch("api._request_json")
+    def test_claude_keeps_distinct_active_scoped_limits(self, request_json):
+        request_json.return_value = {
+            "limits": [
+                {"kind": "weekly_scoped", "scope": "Opus", "percent": 10},
+                {"kind": "weekly_scoped", "scope": "Fable", "percent": 20},
+            ]
+        }
+
+        result = api.fetch_claude({})
+
+        self.assertEqual(
+            [window.label for window in result.windows], ["7d Opus", "7d Fable"]
+        )
+
     @patch.dict(os.environ, {"CODEX_ACCESS_TOKEN": "test-token"}, clear=False)
     @patch("api._request_json")
     def test_codex_separates_codex_chatgpt_and_review_limits(self, request_json):
@@ -193,6 +209,13 @@ class RenderingTests(unittest.TestCase):
 
         self.assertEqual(output, "2026-10-01 18:20")
 
+    def test_millisecond_reset_timestamp_is_supported(self):
+        local = timezone.utc
+
+        output = main.format_reset("1790846400000", local)
+
+        self.assertEqual(output, "2026-10-01 09:20")
+
     def test_provider_theme_wraps_output(self):
         result = api.QuotaResult("Claude", [api.QuotaWindow("5h", 18)])
 
@@ -203,6 +226,17 @@ class RenderingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_provider_zero_is_rejected(self):
+        messages = []
+        provider = config._choose_provider(
+            config.load(),
+            lambda _: "0",
+            messages.append,
+        )
+
+        self.assertIsNone(provider)
+        self.assertEqual(messages[-1], "잘못된 번호입니다.")
+
     def test_menu_registers_key_in_private_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
