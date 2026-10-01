@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +14,9 @@ from typing import Any, Callable
 import requests
 
 TIMEOUT = 15
+OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
+OLLAMA_ACCOUNT_URL = "https://ollama.com/api/me"
+OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
 
 
 @dataclass
@@ -186,26 +191,49 @@ def fetch_codex(settings: dict) -> QuotaResult:
             raise
         token = _refresh_codex_auth(auth_path, auth)
         data = _request_json("GET", url, token, headers)
-    rate_limit = data.get("rate_limit") or {}
+    windows = _codex_rate_windows(data.get("rate_limit"), "Codex")
+    windows.extend(
+        _codex_rate_windows(data.get("code_review_rate_limit"), "code review")
+    )
+    additional = data.get("additional_rate_limits")
+    if isinstance(additional, list):
+        for value in additional:
+            if isinstance(value, dict):
+                label = str(value.get("limit_name") or "additional")
+                windows.extend(_codex_rate_windows(value.get("rate_limit"), label))
+    chatpass = data.get("chatpass")
+    if isinstance(chatpass, dict) and isinstance(chatpass.get("windows"), list):
+        for value in chatpass["windows"]:
+            window = _codex_window(value, "ChatGPT")
+            if window:
+                windows.append(window)
+    plan = str(data["plan_type"]) if data.get("plan_type") else None
+    return QuotaResult(
+        "Codex", windows, None if windows else "unknown usage format", plan
+    )
+
+
+def _codex_rate_windows(value: Any, prefix: str) -> list[QuotaWindow]:
+    if not isinstance(value, dict):
+        return []
     windows = []
-    for name, value in (
-        ("session", rate_limit.get("primary_window")),
-        ("weekly", rate_limit.get("secondary_window")),
-    ):
-        if not isinstance(value, dict):
-            continue
-        label = name
-        seconds = _number(value.get("limit_window_seconds"))
-        if seconds and seconds >= 3 * 86400:
-            label = "weekly"
-        window = _window(
-            label,
-            percent=value.get("used_percent"),
-            reset=value.get("reset_at"),
-        )
+    for candidate in (value.get("primary_window"), value.get("secondary_window")):
+        window = _codex_window(candidate, prefix)
         if window:
             windows.append(window)
-    return QuotaResult("Codex", windows, None if windows else "unknown usage format")
+    return windows
+
+
+def _codex_window(value: Any, prefix: str) -> QuotaWindow | None:
+    if not isinstance(value, dict):
+        return None
+    seconds = _number(value.get("limit_window_seconds"))
+    period = "weekly" if seconds and seconds >= 3 * 86400 else "5h"
+    return _window(
+        f"{prefix} {period}",
+        percent=value.get("used_percent"),
+        reset=value.get("reset_at"),
+    )
 
 
 def fetch_claude(settings: dict) -> QuotaResult:
@@ -221,6 +249,7 @@ def fetch_claude(settings: dict) -> QuotaResult:
         {"anthropic-beta": "oauth-2025-04-20"},
     )
     windows = []
+    labels = set()
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         value = data.get(key)
         if isinstance(value, dict):
@@ -231,17 +260,57 @@ def fetch_claude(settings: dict) -> QuotaResult:
             )
             if window:
                 windows.append(window)
+                labels.add(label)
+    for key, label in (
+        ("seven_day_opus", "7d Opus"),
+        ("seven_day_sonnet", "7d Sonnet"),
+    ):
+        value = data.get(key)
+        if isinstance(value, dict) and _number(value.get("utilization")):
+            window = _window(
+                label,
+                percent=value.get("utilization"),
+                reset=value.get("resets_at"),
+            )
+            if window:
+                windows.append(window)
+                labels.add(label)
     limits = data.get("limits")
     if isinstance(limits, list):
         for value in limits:
             if not isinstance(value, dict):
                 continue
             kind = value.get("kind", "quota")
-            label = {"session": "5h", "weekly_all": "7d"}.get(kind, str(kind))
+            label = {
+                "session": "5h",
+                "weekly_all": "7d",
+                "weekly_model": "7d model",
+                "weekly_scoped": "7d scoped",
+            }.get(kind, str(kind))
+            identity = next(
+                (
+                    str(value[key])
+                    for key in ("model", "scope", "label", "name")
+                    if value.get(key)
+                ),
+                None,
+            )
+            if identity and kind in ("weekly_model", "weekly_scoped"):
+                label = f"7d {identity}"
+            percent = _number(value.get("percent"))
+            if label in labels or not percent:
+                continue
             window = _window(label, percent=value.get("percent"), reset=value.get("resets_at"))
             if window:
                 windows.append(window)
-    return QuotaResult("Claude", windows, None if windows else "unknown usage format")
+                labels.add(label)
+    plan = oauth.get("subscriptionType")
+    return QuotaResult(
+        "Claude",
+        windows,
+        None if windows else "unknown usage format",
+        str(plan) if plan else None,
+    )
 
 
 def fetch_nanogpt(settings: dict) -> QuotaResult:
@@ -280,12 +349,172 @@ def fetch_nanogpt(settings: dict) -> QuotaResult:
 
 
 def fetch_ollama(settings: dict) -> QuotaResult:
-    return _fetch_cloud_usage(
+    token = _secret(settings, "OLLAMA_API_KEY")
+    cookie = settings.get("session_cookie") or os.environ.get("OLLAMA_SESSION_COOKIE")
+    api_windows = []
+    api_plan = None
+    if token:
+        try:
+            data = _request_json("GET", OLLAMA_USAGE_URL, token)
+            api_windows = _ollama_usage_windows(data)
+            api_plan = _plan_name(data)
+            try:
+                account = _request_json("POST", OLLAMA_ACCOUNT_URL, token)
+                api_plan = _plan_name(account) or api_plan
+            except requests.RequestException:
+                pass
+        except requests.RequestException:
+            if not cookie:
+                raise
+    if cookie:
+        try:
+            windows, plan, error = _fetch_ollama_settings(str(cookie))
+        except requests.RequestException:
+            if api_windows:
+                return QuotaResult("Ollama", api_windows, plan=api_plan)
+            raise
+        if windows:
+            merged = {window.label: window for window in api_windows}
+            merged.update({window.label: window for window in windows})
+            ordered = [
+                merged.pop(label)
+                for label in ("5h", "weekly", "monthly")
+                if label in merged
+            ]
+            ordered.extend(merged.values())
+            return QuotaResult("Ollama", ordered, plan=plan or api_plan)
+        if not api_windows:
+            return QuotaResult("Ollama", error=error)
+    if api_windows:
+        return QuotaResult("Ollama", api_windows, plan=api_plan)
+    if token:
+        return QuotaResult("Ollama", error="usage API returned no recognized quotas")
+    return QuotaResult(
         "Ollama",
-        settings,
-        "OLLAMA_API_KEY",
-        "OLLAMA_USAGE_URL",
+        error="set OLLAMA_API_KEY or OLLAMA_SESSION_COOKIE",
     )
+
+
+def _fetch_ollama_settings(
+    cookie: str,
+) -> tuple[list[QuotaWindow], str | None, str]:
+    response = requests.get(
+        OLLAMA_SETTINGS_URL,
+        headers={
+            "Accept": "text/html",
+            "Cookie": cookie,
+            "User-Agent": "howmuch-left/1",
+        },
+        timeout=TIMEOUT,
+        allow_redirects=False,
+    )
+    response.raise_for_status()
+    if response.is_redirect:
+        return [], None, "Ollama session cookie expired"
+    windows, plan = _parse_ollama_settings(response.text)
+    return windows, plan, "settings page returned no recognized quotas"
+
+
+def _ollama_usage_windows(data: dict) -> list[QuotaWindow]:
+    limits = data.get("limits")
+    if not isinstance(limits, dict):
+        return []
+    windows = []
+    for name, label in (
+        ("session", "5h"),
+        ("weekly", "weekly"),
+        ("monthly", "monthly"),
+    ):
+        value = limits.get(name)
+        if not isinstance(value, dict):
+            continue
+        usage = _number(value.get("usage"))
+        if usage is not None and 0 <= usage <= 1:
+            usage *= 100
+        window = _window(
+            label,
+            percent=usage,
+            reset=value.get("resets_at", value.get("reset_at")),
+        )
+        if window:
+            windows.append(window)
+    return windows
+
+
+def _parse_ollama_settings(document: str) -> tuple[list[QuotaWindow], str | None]:
+    text = html.unescape(document)
+    windows = []
+    labels = (
+        ("5h", ("5-hour", "5h", "Session", "Hourly")),
+        ("weekly", ("Weekly",)),
+        ("monthly", ("Monthly",)),
+    )
+    all_names = tuple(name for _, names in labels for name in names)
+    for label, names in labels:
+        block = None
+        for name in names:
+            start = re.search(
+                rf'(?:aria-label=["\'])?{re.escape(name)}\s+usage',
+                text,
+                re.IGNORECASE,
+            )
+            if start:
+                tail = text[start.start() :]
+                next_label = re.search(
+                    "|".join(
+                        rf"{re.escape(other)}\s+usage"
+                        for other in all_names
+                        if other != name
+                    ),
+                    tail[len(start.group(0)) :],
+                    re.IGNORECASE,
+                )
+                end = (
+                    len(start.group(0)) + next_label.start()
+                    if next_label
+                    else 10_000
+                )
+                block = tail[:end]
+                break
+        if not block:
+            continue
+        percent_match = re.search(r"([\d.]+)\s*%\s*used", block, re.IGNORECASE)
+        if not percent_match:
+            percent_match = re.search(
+                r"usage\s+([\d.]+)\s*%", block, re.IGNORECASE
+            )
+        if not percent_match:
+            percent_match = re.search(r"width:\s*([\d.]+)%", block, re.IGNORECASE)
+        used = total = None
+        if label == "monthly":
+            amounts = re.search(
+                r"\$([\d,.]+)\s+of\s+\$([\d,.]+)(?:\s+used)?",
+                block,
+                re.IGNORECASE,
+            )
+            if amounts:
+                used = amounts.group(1).replace(",", "")
+                total = amounts.group(2).replace(",", "")
+        reset_match = re.search(
+            r'data-time=["\']([^"\']+)', block, re.IGNORECASE
+        )
+        window = _window(
+            label,
+            used=used,
+            total=total,
+            percent=percent_match.group(1) if percent_match else None,
+            unit="USD" if used is not None else "",
+            reset=reset_match.group(1) if reset_match else None,
+        )
+        if window:
+            windows.append(window)
+    plan_match = re.search(
+        r"(?:Cloud|Included)\s+Usage[\s\S]{0,300}?\b(Free|Pro|Max|Business)\b",
+        text,
+        re.IGNORECASE,
+    )
+    plan = plan_match.group(1).title() if plan_match else None
+    return windows, plan
 
 
 def fetch_antigravity(settings: dict) -> QuotaResult:
@@ -324,7 +553,12 @@ def _fetch_cloud_usage(
 
 
 def _plan_name(data: dict) -> str | None:
-    plan = data.get("plan") or data.get("tier") or data.get("current_plan")
+    plan = (
+        data.get("plan")
+        or data.get("Plan")
+        or data.get("tier")
+        or data.get("current_plan")
+    )
     subscription = data.get("subscription")
     if not plan and isinstance(subscription, dict):
         plan = subscription.get("plan") or subscription.get("tier") or subscription.get("name")

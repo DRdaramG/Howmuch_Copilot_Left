@@ -22,6 +22,10 @@ Claude 5h                ■■■■■□□□□□ (50%)
 표시됩니다. Copilot, Codex, Claude의 일부 사용량 API는 각 공식 CLI가 사용하는
 내부 엔드포인트이므로 공급자가 응답 형식을 변경할 수 있습니다.
 
+초기화 시각은 시스템 로컬 시간대의 24시간 형식으로 표시합니다. Claude의 중복 한도와
+사용하지 않는 0% 세부 한도는 생략합니다. OpenAI 응답이 별도 한도를 제공하면 Codex,
+ChatGPT(Chatpass), 코드 리뷰 한도를 각각 표시합니다.
+
 ## 설치 및 실행
 
 Python 3.10 이상이 필요합니다.
@@ -34,7 +38,8 @@ python main.py
 ```
 
 기본 실행은 60초마다 화면을 갱신합니다. 한 번만 출력하거나 JSON으로 출력할 수도
-있습니다.
+있습니다. 대화형 실행은 별도 화면에 현재 상태만 표시하며, 서비스별 테마 색상을
+적용합니다. 색상을 끄려면 `NO_COLOR=1` 환경 변수를 사용합니다.
 
 ```bash
 python main.py --once
@@ -43,8 +48,9 @@ python main.py --interval 120
 python main.py --no-clear
 ```
 
-`Ctrl+C`로 종료합니다. 갱신을 기다리는 동안 `Ctrl+S`를 누르면 `$VISUAL` 또는
-`$EDITOR`로 설정 파일을 열고, 편집이 끝나면 즉시 설정을 다시 읽습니다.
+`Ctrl+C`로 종료합니다. 갱신을 기다리는 동안 `Ctrl+S`를 누르면 대화형 설정 메뉴가
+열립니다. 메뉴에서 API 주소 추가, Codex/Claude OAuth 연결, API 키 등록, 서비스
+활성화, 갱신 주기 변경을 할 수 있으며 완료하면 즉시 새 설정을 적용합니다.
 
 ## 인증
 
@@ -56,7 +62,7 @@ python main.py --no-clear
 | Codex | `codex login`으로 생성한 `~/.codex/auth.json`, 또는 `CODEX_ACCESS_TOKEN` |
 | Claude | Claude Code의 `~/.claude/.credentials.json`, 또는 `CLAUDE_ACCESS_TOKEN` |
 | NanoGPT | `NANOGPT_API_KEY` |
-| Ollama Cloud | `OLLAMA_API_KEY` |
+| Ollama Cloud | `OLLAMA_API_KEY`, 또는 `OLLAMA_SESSION_COOKIE` |
 | Antigravity | `ANTIGRAVITY_ACCESS_TOKEN` |
 | DevPass | `DEVPASS_API_KEY` |
 
@@ -66,7 +72,6 @@ python main.py --no-clear
 export COPILOT_TOKEN='...'
 export NANOGPT_API_KEY='...'
 export OLLAMA_API_KEY='...'
-export OLLAMA_USAGE_URL='https://...'
 export ANTIGRAVITY_ACCESS_TOKEN='...'
 export ANTIGRAVITY_USAGE_URL='https://...'
 export DEVPASS_API_KEY='...'
@@ -87,7 +92,7 @@ python main.py
     "codex": {"enabled": true},
     "claude": {"enabled": true},
     "nanogpt": {"enabled": false},
-    "ollama": {"enabled": false, "url": "https://..."},
+    "ollama": {"enabled": false},
     "antigravity": {"enabled": false, "url": "https://..."},
     "devpass": {"enabled": false}
   }
@@ -97,11 +102,17 @@ python main.py
 필요한 공급자만 `enabled`로 설정할 수 있으며, 사설 프록시를 쓰는 경우 각 공급자에
 `url`을 지정할 수 있습니다.
 
-Ollama Cloud와 Antigravity는 현재 공개 문서에 할당량 조회 API나 외부 OAuth 흐름이
-명시되어 있지 않습니다. 따라서 계정에 제공된 할당량 API 또는 호환 프록시 주소를
-각각 `OLLAMA_USAGE_URL`, `ANTIGRAVITY_USAGE_URL`(또는 설정의 `url`)로 지정해야
-합니다. 응답의 요금제와 5시간·일간·주간·월간 한도 및 초기화 시각을 인식해
-표시합니다. 토큰을 설정 파일에 직접 넣을 수도 있지만 환경 변수 사용을 권장합니다.
+Ollama Cloud는 API 키로 고정된 `https://ollama.com/api/usage`를 조회해 세션·주간·
+월간 사용량을 표시합니다. API 키는 `Ctrl+S` 설정 메뉴에서 등록할 수도 있습니다.
+API 키를 사용할 수 없으면 브라우저 개발자 도구에서 `ollama.com`의 전체
+`__Secure-session=...` 쿠키 값을 복사해 `OLLAMA_SESSION_COOKIE`로 지정할 수
+있습니다. 이 경우 로그인된 설정 페이지의 서버 렌더링 HTML을 읽으므로 별도 headless
+브라우저 설치가 필요하지 않습니다. 쿠키는 비밀번호처럼 취급하고 환경 변수로만
+전달하는 것을 권장합니다.
+
+Antigravity는 계정에 제공된 할당량 API 또는 호환 프록시 주소를
+`ANTIGRAVITY_USAGE_URL`(또는 설정의 `url`)로 지정해야 합니다. 응답의 요금제와
+5시간·일간·주간·월간 한도 및 초기화 시각을 인식해 표시합니다.
 
 ## 테스트
 

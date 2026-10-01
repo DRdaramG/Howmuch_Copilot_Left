@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import getpass
 import json
 import os
-import shlex
 import subprocess
+import tempfile
 from pathlib import Path
+from typing import Callable
 
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_FILE = CONFIG_HOME / "howmuch-left" / "config.json"
@@ -23,6 +25,21 @@ DEFAULTS = {
         "antigravity": {"enabled": False},
         "devpass": {"enabled": False},
     },
+}
+
+OAUTH_COMMANDS = {
+    "codex": ["codex", "login"],
+    "claude": ["claude", "login"],
+}
+
+KEY_NAMES = {
+    "copilot": "COPILOT_TOKEN",
+    "codex": "CODEX_ACCESS_TOKEN",
+    "claude": "CLAUDE_ACCESS_TOKEN",
+    "nanogpt": "NANOGPT_API_KEY",
+    "ollama": "OLLAMA_API_KEY",
+    "antigravity": "ANTIGRAVITY_ACCESS_TOKEN",
+    "devpass": "DEVPASS_API_KEY",
 }
 
 
@@ -44,14 +61,118 @@ def load(path: Path | None = None) -> dict:
     return settings
 
 
-def edit(path: Path | None = None) -> None:
+def save(settings: dict, path: Path | None = None) -> None:
     config_path = path or CONFIG_FILE
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    if not config_path.exists():
-        config_path.write_text(
-            json.dumps(DEFAULTS, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    config_path.chmod(0o600)
-    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
-    subprocess.run([*shlex.split(editor), str(config_path)], check=False)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=config_path.parent, delete=False
+    ) as temporary:
+        json.dump(settings, temporary, ensure_ascii=False, indent=2)
+        temporary.write("\n")
+        temporary_path = Path(temporary.name)
+    temporary_path.chmod(0o600)
+    temporary_path.replace(config_path)
+
+
+def _choose_provider(
+    settings: dict,
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+    allowed: set[str] | None = None,
+) -> str | None:
+    providers = [
+        name for name in settings["providers"] if allowed is None or name in allowed
+    ]
+    for index, name in enumerate(providers, 1):
+        output_fn(f"  [{index}] {name}")
+    choice = input_fn("서비스 번호 (취소: Enter): ").strip()
+    if not choice:
+        return None
+    try:
+        index = int(choice)
+        if not 1 <= index <= len(providers):
+            raise ValueError
+        return providers[index - 1]
+    except ValueError:
+        output_fn("잘못된 번호입니다.")
+        return None
+
+
+def menu(
+    path: Path | None = None,
+    *,
+    input_fn: Callable[[str], str] = input,
+    secret_input_fn: Callable[[str], str] = getpass.getpass,
+    output_fn: Callable[[str], None] = print,
+    run_fn: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> dict:
+    settings = load(path)
+    while True:
+        output_fn("\n설정 메뉴")
+        output_fn("  [1] API 추가/주소 설정")
+        output_fn("  [2] OAuth 연결")
+        output_fn("  [3] API 키 등록")
+        output_fn("  [4] 서비스 켜기/끄기")
+        output_fn("  [5] 갱신 주기 변경")
+        output_fn("  [0] 완료")
+        choice = input_fn("선택: ").strip()
+
+        if choice == "0":
+            return settings
+        if choice == "1":
+            provider = _choose_provider(settings, input_fn, output_fn)
+            if provider:
+                current = settings["providers"][provider].get("url", "")
+                url = input_fn(f"API 주소 [{current}]: ").strip()
+                if url:
+                    settings["providers"][provider]["url"] = url
+                settings["providers"][provider]["enabled"] = True
+                save(settings, path)
+                output_fn(f"{provider} API 설정을 저장했습니다.")
+        elif choice == "2":
+            provider = _choose_provider(
+                settings, input_fn, output_fn, set(OAUTH_COMMANDS)
+            )
+            if provider:
+                try:
+                    result = run_fn(OAUTH_COMMANDS[provider], check=False)
+                except FileNotFoundError:
+                    output_fn(f"{provider} CLI를 찾을 수 없습니다.")
+                    continue
+                if result.returncode == 0:
+                    settings["providers"][provider]["enabled"] = True
+                    save(settings, path)
+                    output_fn(f"{provider} OAuth 연결을 완료했습니다.")
+                else:
+                    output_fn(f"{provider} OAuth 연결에 실패했습니다.")
+        elif choice == "3":
+            provider = _choose_provider(settings, input_fn, output_fn)
+            if provider:
+                token = secret_input_fn(f"{KEY_NAMES[provider]}: ").strip()
+                if token:
+                    settings["providers"][provider]["token"] = token
+                    settings["providers"][provider]["enabled"] = True
+                    save(settings, path)
+                    output_fn(f"{provider} 키를 저장했습니다.")
+        elif choice == "4":
+            provider = _choose_provider(settings, input_fn, output_fn)
+            if provider:
+                values = settings["providers"][provider]
+                values["enabled"] = not values.get("enabled", False)
+                save(settings, path)
+                state = "켰습니다" if values["enabled"] else "껐습니다"
+                output_fn(f"{provider} 서비스를 {state}.")
+        elif choice == "5":
+            value = input_fn("갱신 주기(초): ").strip()
+            try:
+                interval = int(value)
+                if interval < 1:
+                    raise ValueError
+            except ValueError:
+                output_fn("1 이상의 정수를 입력하세요.")
+            else:
+                settings["refresh_interval_seconds"] = interval
+                save(settings, path)
+                output_fn("갱신 주기를 저장했습니다.")
+        else:
+            output_fn("메뉴 번호를 선택하세요.")
