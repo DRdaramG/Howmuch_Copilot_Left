@@ -1,5 +1,7 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import api
@@ -27,15 +29,16 @@ class QuotaParsingTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "test-token"}, clear=False)
     @patch("api._request_json")
-    def test_claude_fractional_utilization(self, request_json):
+    def test_claude_percentage_and_scoped_limits(self, request_json):
         request_json.return_value = {
-            "five_hour": {"utilization": 0.25, "resets_at": "soon"},
-            "seven_day": {"utilization": 0.5},
+            "five_hour": {"utilization": 25, "resets_at": "soon"},
+            "seven_day": {"utilization": 50},
+            "limits": [{"kind": "weekly_model", "percent": 10}],
         }
 
         result = api.fetch_claude({})
 
-        self.assertEqual([window.used_percent for window in result.windows], [25, 50])
+        self.assertEqual([window.used_percent for window in result.windows], [25, 50, 10])
 
     @patch.dict(os.environ, {"DEVPASS_API_KEY": "test-token"}, clear=False)
     @patch("api._request_json")
@@ -52,6 +55,23 @@ class QuotaParsingTests(unittest.TestCase):
         result = api.fetch_devpass({})
 
         self.assertEqual([window.used_percent for window in result.windows], [30, 25])
+
+    @patch("api.requests.post")
+    def test_codex_refresh_rotates_and_secures_credentials(self, post):
+        response = post.return_value
+        response.json.return_value = {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auth.json"
+            auth = {"tokens": {"access_token": "old", "refresh_token": "old-refresh"}}
+
+            token = api._refresh_codex_auth(path, auth)
+
+            self.assertEqual(token, "new-access")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(api._read_json(path)["tokens"]["refresh_token"], "new-refresh")
 
 
 class RenderingTests(unittest.TestCase):

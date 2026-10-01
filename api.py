@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -95,6 +96,47 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
+def _refresh_codex_auth(path: Path, auth: dict) -> str:
+    tokens = auth.get("tokens")
+    refresh_token = tokens.get("refresh_token") if isinstance(tokens, dict) else None
+    if not refresh_token:
+        raise ValueError("Codex login expired; run `codex login`")
+    response = requests.post(
+        "https://auth.openai.com/oauth/token",
+        json={
+            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email",
+        },
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    refreshed = response.json()
+    access_token = refreshed.get("access_token")
+    if not access_token:
+        raise ValueError("Codex token refresh returned no access token")
+    latest = _read_json(path)
+    latest_tokens = latest.get("tokens") if isinstance(latest.get("tokens"), dict) else {}
+    if latest_tokens.get("refresh_token") not in (None, refresh_token):
+        latest_access_token = latest_tokens.get("access_token")
+        if latest_access_token:
+            return str(latest_access_token)
+    tokens["access_token"] = access_token
+    for key in ("refresh_token", "id_token"):
+        if refreshed.get(key):
+            tokens[key] = refreshed[key]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        json.dump(auth, temporary, indent=2)
+        temporary_path = Path(temporary.name)
+    temporary_path.chmod(0o600)
+    temporary_path.replace(path)
+    return str(access_token)
+
+
 def fetch_copilot(settings: dict) -> QuotaResult:
     token = _secret(settings, "COPILOT_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
@@ -135,12 +177,14 @@ def fetch_codex(settings: dict) -> QuotaResult:
         return QuotaResult("Codex", error="run `codex login` or set CODEX_ACCESS_TOKEN")
     account_id = settings.get("account_id") or tokens.get("account_id")
     headers = {"ChatGPT-Account-Id": str(account_id)} if account_id else {}
-    data = _request_json(
-        "GET",
-        settings.get("url", "https://chatgpt.com/backend-api/wham/usage"),
-        token,
-        headers,
-    )
+    url = settings.get("url", "https://chatgpt.com/backend-api/wham/usage")
+    try:
+        data = _request_json("GET", url, token, headers)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code not in (401, 403):
+            raise
+        token = _refresh_codex_auth(auth_path, auth)
+        data = _request_json("GET", url, token, headers)
     rate_limit = data.get("rate_limit") or {}
     windows = []
     for name, value in (
@@ -176,6 +220,16 @@ def fetch_claude(settings: dict) -> QuotaResult:
         {"anthropic-beta": "oauth-2025-04-20"},
     )
     windows = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        value = data.get(key)
+        if isinstance(value, dict):
+            window = _window(
+                label,
+                percent=value.get("utilization"),
+                reset=value.get("resets_at"),
+            )
+            if window:
+                windows.append(window)
     limits = data.get("limits")
     if isinstance(limits, list):
         for value in limits:
@@ -186,16 +240,6 @@ def fetch_claude(settings: dict) -> QuotaResult:
             window = _window(label, percent=value.get("percent"), reset=value.get("resets_at"))
             if window:
                 windows.append(window)
-    else:
-        for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-            value = data.get(key)
-            if isinstance(value, dict):
-                utilization = _number(value.get("utilization"))
-                if utilization is not None and utilization <= 1:
-                    utilization *= 100
-                window = _window(label, percent=utilization, reset=value.get("resets_at"))
-                if window:
-                    windows.append(window)
     return QuotaResult("Claude", windows, None if windows else "unknown usage format")
 
 
