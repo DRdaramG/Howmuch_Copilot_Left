@@ -1,186 +1,344 @@
-"""GitHub Copilot quota API interaction.
+"""Quota adapters for supported AI services."""
 
-Uses the internal Copilot user endpoint to fetch premium-request usage:
-    GET https://api.github.com/copilot_internal/user
+from __future__ import annotations
 
-The response contains ``quota_snapshots.premium_interactions`` with
-``used`` and ``limit`` fields.
-
-Token generation uses the GitHub OAuth **Device Flow** with the same
-client ID used by the official GitHub Copilot VS Code extension, so the
-resulting ``gho_`` token already has the required Copilot scope.
-
-Reference: https://copilotstats.com/
-"""
-
-import logging
-import time
-from typing import Optional, Tuple
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
 
 import requests
 
-logger = logging.getLogger(__name__)
-
-_GITHUB_API = "https://api.github.com"
-REQUEST_TIMEOUT = 30  # seconds
-
-# GitHub OAuth App client ID used by the Copilot VS Code extension.
-# This is a public, non-secret identifier embedded in the extension source.
-DEVICE_FLOW_CLIENT_ID = "Iv1.b507a08c87ecfe98"
+TIMEOUT = 15
 
 
-# ---------------------------------------------------------------------------
-# Device Flow token generation
-# ---------------------------------------------------------------------------
-
-def request_device_code() -> dict:
-    """Start the Device Flow and return the device-code payload.
-
-    Returns a dict with at least ``device_code``, ``user_code``, and
-    ``verification_uri``.
-    """
-    resp = requests.post(
-        "https://github.com/login/device/code",
-        data={
-            "client_id": DEVICE_FLOW_CLIENT_ID,
-            "scope": "copilot",
-        },
-        headers={"Accept": "application/json"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    logger.debug("Device code response: %s", {k: v for k, v in data.items() if k != "device_code"})
-    return data
+@dataclass
+class QuotaWindow:
+    label: str
+    used_percent: float
+    used: float | None = None
+    total: float | None = None
+    unit: str = ""
+    resets_at: str | None = None
 
 
-def poll_for_token(device_code: str, interval: int = 5, timeout: int = 300) -> Optional[str]:
-    """Poll GitHub until the user authorises the device, then return the token.
-
-    Returns *None* if the user does not authorise within *timeout* seconds.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        time.sleep(interval)
-        resp = requests.post(
-            "https://github.com/login/oauth/access_token",
-            data={
-                "client_id": DEVICE_FLOW_CLIENT_ID,
-                "device_code": device_code,
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            },
-            headers={"Accept": "application/json"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        data = resp.json()
-        if "access_token" in data:
-            logger.info("Device Flow: token obtained successfully.")
-            return data["access_token"]
-        error = data.get("error")
-        if error == "authorization_pending":
-            continue
-        if error == "slow_down":
-            interval += 5
-            continue
-        # expired_token, access_denied, etc.
-        logger.warning("Device Flow error: %s", error)
-        return None
-    logger.warning("Device Flow timed out after %d seconds.", timeout)
-    return None
+@dataclass
+class QuotaResult:
+    provider: str
+    windows: list[QuotaWindow] = field(default_factory=list)
+    error: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Quota fetch
-# ---------------------------------------------------------------------------
-
-def fetch_quota(api_key: str) -> Tuple[Optional[float], Optional[int]]:
-    """Return *(used, total)* premium-request counts.
-
-    Calls ``GET /copilot_internal/user`` and reads
-    ``quota_snapshots.premium_interactions``.
-
-    Returns *(None, None)* on any error so callers can show a fallback.
-    """
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-
+def _number(value: Any) -> float | None:
     try:
-        resp = requests.get(
-            f"{_GITHUB_API}/copilot_internal/user",
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _window(
+    label: str,
+    *,
+    used: Any = None,
+    total: Any = None,
+    percent: Any = None,
+    remaining: Any = None,
+    unit: str = "",
+    reset: Any = None,
+) -> QuotaWindow | None:
+    used_num, total_num = _number(used), _number(total)
+    remaining_num = _number(remaining)
+    percent_num = _number(percent)
+    if used_num is None and total_num is not None and remaining_num is not None:
+        used_num = total_num - remaining_num
+    if percent_num is None and used_num is not None and total_num:
+        percent_num = used_num / total_num * 100
+    if percent_num is None:
+        return None
+    return QuotaWindow(
+        label=label,
+        used_percent=max(0.0, min(100.0, percent_num)),
+        used=used_num,
+        total=total_num,
+        unit=unit,
+        resets_at=str(reset) if reset else None,
+    )
+
+
+def _request_json(
+    method: str, url: str, token: str | None = None, headers: dict | None = None
+) -> dict:
+    request_headers = {"Accept": "application/json", **(headers or {})}
+    if token:
+        request_headers.setdefault("Authorization", "Bearer" + " " + token)
+    response = requests.request(
+        method, url, headers=request_headers, timeout=TIMEOUT
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("API returned a non-object response")
+    return payload
+
+
+def _secret(settings: dict, env_name: str) -> str | None:
+    value = settings.get("token") or os.environ.get(env_name)
+    return str(value) if value else None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _refresh_codex_auth(path: Path, auth: dict) -> str:
+    tokens = auth.get("tokens")
+    refresh_token = tokens.get("refresh_token") if isinstance(tokens, dict) else None
+    if not refresh_token:
+        raise ValueError("Codex login expired; run `codex login`")
+    response = requests.post(
+        "https://auth.openai.com/oauth/token",
+        json={
+            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email",
+        },
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    refreshed = response.json()
+    access_token = refreshed.get("access_token")
+    if not access_token:
+        raise ValueError("Codex token refresh returned no access token")
+    latest = _read_json(path)
+    latest_tokens = latest.get("tokens") if isinstance(latest.get("tokens"), dict) else {}
+    if latest_tokens.get("refresh_token") not in (None, refresh_token):
+        latest_access_token = latest_tokens.get("access_token")
+        if latest_access_token:
+            return str(latest_access_token)
+    tokens["access_token"] = access_token
+    for key in ("refresh_token", "id_token"):
+        if refreshed.get(key):
+            tokens[key] = refreshed[key]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        json.dump(auth, temporary, indent=2)
+        temporary_path = Path(temporary.name)
+    temporary_path.chmod(0o600)
+    temporary_path.replace(path)
+    return str(access_token)
+
+
+def fetch_copilot(settings: dict) -> QuotaResult:
+    token = _secret(settings, "COPILOT_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return QuotaResult("Copilot", error="set COPILOT_TOKEN")
+    data = _request_json(
+        "GET",
+        settings.get("url", "https://api.github.com/copilot_internal/user"),
+        token,
+    )
+    snapshots = data.get("quota_snapshots") or {}
+    quota = (
+        snapshots.get("ai_credits")
+        or snapshots.get("premium_interactions")
+        or data.get("ai_credits")
+        or {}
+    )
+    if not isinstance(quota, dict):
+        return QuotaResult("Copilot", error="AI credit quota is absent")
+    total = quota.get("entitlement", quota.get("limit", quota.get("total")))
+    window = _window(
+        "AI credits",
+        used=quota.get("used", quota.get("usage")),
+        total=total,
+        remaining=quota.get("quota_remaining", quota.get("remaining")),
+        percent=quota.get("percent_used"),
+        unit="credits",
+        reset=quota.get("reset_at", quota.get("resets_at")),
+    )
+    return QuotaResult("Copilot", [window] if window else [], None if window else "unknown AI credit format")
+
+
+def fetch_codex(settings: dict) -> QuotaResult:
+    auth_path = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "auth.json"
+    auth = _read_json(auth_path)
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+    token = _secret(settings, "CODEX_ACCESS_TOKEN") or tokens.get("access_token")
+    if not token:
+        return QuotaResult("Codex", error="run `codex login` or set CODEX_ACCESS_TOKEN")
+    account_id = settings.get("account_id") or tokens.get("account_id")
+    headers = {"ChatGPT-Account-Id": str(account_id)} if account_id else {}
+    url = settings.get("url", "https://chatgpt.com/backend-api/wham/usage")
+    try:
+        data = _request_json("GET", url, token, headers)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code not in (401, 403):
+            raise
+        token = _refresh_codex_auth(auth_path, auth)
+        data = _request_json("GET", url, token, headers)
+    rate_limit = data.get("rate_limit") or {}
+    windows = []
+    for name, value in (
+        ("session", rate_limit.get("primary_window")),
+        ("weekly", rate_limit.get("secondary_window")),
+    ):
+        if not isinstance(value, dict):
+            continue
+        label = name
+        seconds = _number(value.get("limit_window_seconds"))
+        if seconds and seconds >= 3 * 86400:
+            label = "weekly"
+        window = _window(
+            label,
+            percent=value.get("used_percent"),
+            reset=value.get("reset_at"),
         )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.HTTPError as exc:
-        status = getattr(exc.response, "status_code", None)
-        if status == 401:
-            logger.warning("Invalid or expired token (401). Please generate a new token.")
-        elif status == 403:
-            logger.warning("Access denied (403). Make sure you have an active Copilot subscription.")
-        else:
-            logger.warning("HTTP error: %s", exc)
-        return None, None
-    except requests.exceptions.RequestException as exc:
-        logger.warning("Network error: %s", exc)
-        return None, None
-    except ValueError as exc:
-        logger.warning("JSON parse error: %s", exc)
-        return None, None
+        if window:
+            windows.append(window)
+    return QuotaResult("Codex", windows, None if windows else "unknown usage format")
 
-    # Check for plan
-    if data.get("_noPlan") or not data.get("quota_snapshots"):
-        snapshots = data.get("quota_snapshots")
-        if not snapshots or not isinstance(snapshots, dict):
-            logger.warning(
-                "No quota_snapshots in response. Keys: %s",
-                list(data.keys()),
+
+def fetch_claude(settings: dict) -> QuotaResult:
+    credentials = _read_json(Path("~/.claude/.credentials.json"))
+    oauth = credentials.get("claudeAiOauth") if isinstance(credentials.get("claudeAiOauth"), dict) else {}
+    token = _secret(settings, "CLAUDE_ACCESS_TOKEN") or oauth.get("accessToken")
+    if not token:
+        return QuotaResult("Claude", error="set CLAUDE_ACCESS_TOKEN or log in with Claude Code")
+    data = _request_json(
+        "GET",
+        settings.get("url", "https://api.anthropic.com/api/oauth/usage"),
+        token,
+        {"anthropic-beta": "oauth-2025-04-20"},
+    )
+    windows = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        value = data.get(key)
+        if isinstance(value, dict):
+            window = _window(
+                label,
+                percent=value.get("utilization"),
+                reset=value.get("resets_at"),
             )
-            return None, None
+            if window:
+                windows.append(window)
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        for value in limits:
+            if not isinstance(value, dict):
+                continue
+            kind = value.get("kind", "quota")
+            label = {"session": "5h", "weekly_all": "7d"}.get(kind, str(kind))
+            window = _window(label, percent=value.get("percent"), reset=value.get("resets_at"))
+            if window:
+                windows.append(window)
+    return QuotaResult("Claude", windows, None if windows else "unknown usage format")
 
-    snapshots = data["quota_snapshots"]
-    premium = snapshots.get("premium_interactions")
-    if not isinstance(premium, dict):
-        logger.warning(
-            "No premium_interactions in quota_snapshots. Keys: %s",
-            list(snapshots.keys()),
+
+def fetch_nanogpt(settings: dict) -> QuotaResult:
+    token = _secret(settings, "NANOGPT_API_KEY")
+    if not token:
+        return QuotaResult("NanoGPT", error="set NANOGPT_API_KEY")
+    data = _request_json(
+        "GET",
+        settings.get("url", "https://nano-gpt.com/api/subscription/v1/usage"),
+        headers={"x-api-key": token},
+    )
+    windows = []
+    for key, label, unit in (
+        ("dailyInputTokens", "daily", "tokens"),
+        ("weeklyInputTokens", "weekly", "tokens"),
+        ("dailyImages", "daily images", "images"),
+    ):
+        value = data.get(key)
+        if not isinstance(value, dict):
+            continue
+        percent = _number(value.get("percentUsed"))
+        if percent is not None and percent <= 1:
+            percent *= 100
+        window = _window(
+            label,
+            used=value.get("used"),
+            total=(data.get("limits") or {}).get(key),
+            percent=percent,
+            remaining=value.get("remaining"),
+            unit=unit,
+            reset=value.get("resetAt"),
         )
-        return None, None
+        if window:
+            windows.append(window)
+    return QuotaResult("NanoGPT", windows, None if windows else "subscription is inactive or unavailable")
 
-    # Response fields:
-    #   entitlement    – total monthly limit (e.g. 1500)
-    #   quota_remaining – remaining count (e.g. 1310.36)
-    #   remaining       – remaining (integer)
-    #   percent_remaining – percentage left (e.g. 87.35)
-    entitlement = premium.get("entitlement")
-    remaining = premium.get("quota_remaining") or premium.get("remaining")
 
-    if entitlement is not None and remaining is not None:
-        try:
-            total = int(entitlement)
-            used_f = round(float(entitlement) - float(remaining), 2)
-            logger.info(
-                "Copilot usage: %.2f / %d  (remaining: %s)",
-                used_f, total, remaining,
-            )
-            return used_f, total
-        except (TypeError, ValueError):
-            logger.warning(
-                "Cannot parse entitlement=%r / remaining=%r",
-                entitlement, remaining,
-            )
-            return None, None
+def fetch_ollama(settings: dict) -> QuotaResult:
+    base = str(settings.get("url", "http://localhost:11434")).rstrip("/")
+    data = _request_json("GET", f"{base}/api/ps")
+    count = len(data.get("models", [])) if isinstance(data.get("models"), list) else 0
+    return QuotaResult(
+        "Ollama",
+        [QuotaWindow("local (unlimited)", 0, count, count, "loaded models")],
+    )
 
-    # Fallback: try used/limit directly
-    used = premium.get("used")
-    limit = premium.get("limit")
-    if used is not None and limit is not None:
-        try:
-            return float(used), int(limit)
-        except (TypeError, ValueError):
-            pass
 
-    logger.warning("Cannot extract quota from premium_interactions: %s", premium)
-    return None, None
+def fetch_devpass(settings: dict) -> QuotaResult:
+    token = _secret(settings, "DEVPASS_API_KEY")
+    if not token:
+        return QuotaResult("DevPass", error="set DEVPASS_API_KEY")
+    payload = _request_json(
+        "GET", settings.get("url", "https://api.llmgateway.io/v1/key"), token
+    )
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    windows = []
+    for label, used_key, limit_key, reset_key in (
+        ("credits", "devPlanCreditsUsed", "devPlanCreditsLimit", None),
+        (
+            "premium weekly",
+            "devPlanPremiumCreditsUsed",
+            "devPlanPremiumWeeklyLimit",
+            "devPlanPremiumWeekResetsAt",
+        ),
+    ):
+        window = _window(
+            label,
+            used=data.get(used_key),
+            total=data.get(limit_key),
+            unit="credits",
+            reset=data.get(reset_key) if reset_key else None,
+        )
+        if window:
+            windows.append(window)
+    if not windows:
+        window = _window("usage", used=data.get("usage"), total=data.get("limit"))
+        if window:
+            windows.append(window)
+    return QuotaResult("DevPass", windows, None if windows else "unknown usage format")
+
+
+PROVIDERS: dict[str, Callable[[dict], QuotaResult]] = {
+    "copilot": fetch_copilot,
+    "codex": fetch_codex,
+    "claude": fetch_claude,
+    "nanogpt": fetch_nanogpt,
+    "ollama": fetch_ollama,
+    "devpass": fetch_devpass,
+}
+
+
+def fetch_provider(name: str, settings: dict) -> QuotaResult:
+    fetcher = PROVIDERS.get(name)
+    if fetcher is None:
+        return QuotaResult(name, error="unsupported provider")
+    try:
+        return fetcher(settings)
+    except requests.RequestException as exc:
+        return QuotaResult(name.title(), error=f"request failed: {exc}")
+    except (TypeError, ValueError, KeyError) as exc:
+        return QuotaResult(name.title(), error=f"invalid response: {exc}")
