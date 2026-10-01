@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from datetime import timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import api
 import config
@@ -108,23 +108,32 @@ class QuotaParsingTests(unittest.TestCase):
     @patch.dict(os.environ, {"OLLAMA_API_KEY": "test-token"}, clear=False)
     @patch("api._request_json")
     def test_ollama_cloud_usage_api(self, request_json):
-        request_json.return_value = {
-            "plan": "Pro",
-            "limits": {
-                "session": {"usage": 0.25},
-                "weekly": {"usage": 0.4},
-                "monthly": {"usage": 0.1},
+        request_json.side_effect = [
+            {
+                "limits": {
+                    "session": {"usage": 0.25},
+                    "weekly": {"usage": 0.4},
+                    "monthly": {"usage": 0.1},
+                },
             },
-        }
+            {"Plan": "pro"},
+        ]
 
         result = api.fetch_ollama({})
 
-        self.assertEqual(result.plan, "Pro")
+        self.assertEqual(result.plan, "pro")
         self.assertEqual(
             [window.label for window in result.windows], ["5h", "weekly", "monthly"]
         )
         self.assertEqual(
             [window.used_percent for window in result.windows], [25, 40, 10]
+        )
+        self.assertEqual(
+            request_json.call_args_list,
+            [
+                call("GET", api.OLLAMA_USAGE_URL, "test-token"),
+                call("POST", api.OLLAMA_ACCOUNT_URL, "test-token"),
+            ],
         )
 
     @patch.dict(

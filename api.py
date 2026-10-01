@@ -15,6 +15,7 @@ import requests
 
 TIMEOUT = 15
 OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
+OLLAMA_ACCOUNT_URL = "https://ollama.com/api/me"
 OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
 
 
@@ -350,40 +351,55 @@ def fetch_nanogpt(settings: dict) -> QuotaResult:
 def fetch_ollama(settings: dict) -> QuotaResult:
     token = _secret(settings, "OLLAMA_API_KEY")
     cookie = settings.get("session_cookie") or os.environ.get("OLLAMA_SESSION_COOKIE")
+    api_windows = []
+    api_plan = None
     if token:
         try:
             data = _request_json("GET", OLLAMA_USAGE_URL, token)
-            windows = _ollama_usage_windows(data)
-            if windows:
-                return QuotaResult("Ollama", windows, plan=_plan_name(data))
+            api_windows = _ollama_usage_windows(data)
+            api_plan = _plan_name(data)
+            try:
+                account = _request_json("POST", OLLAMA_ACCOUNT_URL, token)
+                api_plan = _plan_name(account) or api_plan
+            except requests.RequestException:
+                pass
         except requests.RequestException:
             if not cookie:
                 raise
     if cookie:
-        response = requests.get(
-            OLLAMA_SETTINGS_URL,
-            headers={
-                "Accept": "text/html",
-                "Cookie": str(cookie),
-                "User-Agent": "howmuch-left/1",
-            },
-            timeout=TIMEOUT,
-            allow_redirects=False,
-        )
-        response.raise_for_status()
-        if response.is_redirect:
-            return QuotaResult("Ollama", error="Ollama session cookie expired")
-        windows, plan = _parse_ollama_settings(response.text)
-        return QuotaResult(
-            "Ollama",
-            windows,
-            None if windows else "settings page returned no recognized quotas",
-            plan,
-        )
+        windows, plan, error = _fetch_ollama_settings(str(cookie))
+        if windows:
+            return QuotaResult("Ollama", windows, plan=plan or api_plan)
+        if not api_windows:
+            return QuotaResult("Ollama", error=error)
+    if api_windows:
+        return QuotaResult("Ollama", api_windows, plan=api_plan)
+    if token:
+        return QuotaResult("Ollama", error="usage API returned no recognized quotas")
     return QuotaResult(
         "Ollama",
         error="set OLLAMA_API_KEY or OLLAMA_SESSION_COOKIE",
     )
+
+
+def _fetch_ollama_settings(
+    cookie: str,
+) -> tuple[list[QuotaWindow], str | None, str]:
+    response = requests.get(
+        OLLAMA_SETTINGS_URL,
+        headers={
+            "Accept": "text/html",
+            "Cookie": cookie,
+            "User-Agent": "howmuch-left/1",
+        },
+        timeout=TIMEOUT,
+        allow_redirects=False,
+    )
+    response.raise_for_status()
+    if response.is_redirect:
+        return [], None, "Ollama session cookie expired"
+    windows, plan = _parse_ollama_settings(response.text)
+    return windows, plan, "settings page returned no recognized quotas"
 
 
 def _ollama_usage_windows(data: dict) -> list[QuotaWindow]:
@@ -491,7 +507,12 @@ def _fetch_cloud_usage(
 
 
 def _plan_name(data: dict) -> str | None:
-    plan = data.get("plan") or data.get("tier") or data.get("current_plan")
+    plan = (
+        data.get("plan")
+        or data.get("Plan")
+        or data.get("tier")
+        or data.get("current_plan")
+    )
     subscription = data.get("subscription")
     if not plan and isinstance(subscription, dict):
         plan = subscription.get("plan") or subscription.get("tier") or subscription.get("name")
