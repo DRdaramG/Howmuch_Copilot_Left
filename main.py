@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import select
 import signal
 import sys
 import termios
 import time
 import tty
+import unicodedata
 from dataclasses import asdict
 from datetime import datetime, tzinfo
 
@@ -19,6 +21,7 @@ import config
 
 BAR_WIDTH = 10
 RESET = "\033[0m"
+DIM = "\033[90m"
 PROVIDER_COLORS = {
     "copilot": "\033[38;5;212m",
     "codex": "\033[38;5;40m",
@@ -30,10 +33,34 @@ PROVIDER_COLORS = {
 }
 
 
-def progress_bar(percent: float) -> str:
+def progress_bar(
+    percent: float, width: int = BAR_WIDTH, color: str | None = None
+) -> str:
     percent = max(0.0, min(100.0, percent))
-    filled = round(percent * BAR_WIDTH / 100)
-    return "■" * filled + "□" * (BAR_WIDTH - filled)
+    filled = round(percent * width / 100)
+    empty = width - filled
+    if color:
+        return f"{color}{'█' * filled}{DIM}{'░' * empty}{RESET}"
+    return "█" * filled + "░" * empty
+
+
+def display_width(text: str) -> int:
+    clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    width = 0
+    for ch in clean:
+        if unicodedata.east_asian_width(ch) in ("F", "W"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def pad(text: str, width: int, align: str = "left") -> str:
+    dw = display_width(text)
+    spaces = max(0, width - dw)
+    if align == "right":
+        return " " * spaces + text
+    return text + " " * spaces
 
 
 def format_reset(value: str, local_timezone: tzinfo | None = None) -> str:
@@ -59,43 +86,111 @@ def format_reset(value: str, local_timezone: tzinfo | None = None) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M")
 
 
-def _themed(line: str, provider: str, color: bool) -> str:
-    theme = PROVIDER_COLORS.get(provider.lower()) if color else None
-    return f"{theme}{line}{RESET}" if theme else line
-
-
 def render(results: list[api.QuotaResult], *, color: bool = False) -> str:
-    lines = [f"AI quota usage · {datetime.now().astimezone():%Y-%m-%d %H:%M:%S %Z}"]
+    header_title = f"AI quota usage · {datetime.now().astimezone():%Y-%m-%d %H:%M:%S %Z}"
+    lines = [header_title]
+    if not results:
+        lines.append("No active providers enabled.")
+        return "\n".join(lines)
+
+    headers = ["Service", "Quota", "Usage", "Details", "Reset"]
+    rows: list[dict[str, str]] = []
+
     for result in results:
-        provider = result.provider
+        service_name = result.provider
         if result.plan:
-            provider += f" ({result.plan})"
+            service_name += f" ({result.plan})"
+        provider_key = result.provider.lower()
+        theme = PROVIDER_COLORS.get(provider_key) if color else None
+
         if result.error:
-            lines.append(
-                _themed(
-                    f"{provider:<12} unavailable: {result.error}",
-                    result.provider,
-                    color,
-                )
-            )
+            rows.append({
+                "service": service_name,
+                "provider": result.provider,
+                "quota": f"unavailable: {result.error}",
+                "usage": "-",
+                "details": "-",
+                "reset": "-",
+                "theme": theme or "",
+            })
             continue
+
         if not result.windows:
-            lines.append(
-                _themed(
-                    f"{provider:<12} no quota reported", result.provider, color
-                )
-            )
+            rows.append({
+                "service": service_name,
+                "provider": result.provider,
+                "quota": "no quota reported",
+                "usage": "-",
+                "details": "-",
+                "reset": "-",
+                "theme": theme or "",
+            })
             continue
+
         for window in result.windows:
-            label = f"{provider} {window.label}".strip()
-            suffix = f"{progress_bar(window.used_percent)} ({window.used_percent:.0f}%)"
+            details = "-"
             if window.used is not None and window.total is not None:
-                suffix += f"  {window.used:g}/{window.total:g} {window.unit}".rstrip()
-            if window.resets_at:
-                suffix += f"  resets {format_reset(window.resets_at)}"
-            lines.append(
-                _themed(f"{label:<24} {suffix}", result.provider, color)
-            )
+                details = f"{window.used:g}/{window.total:g} {window.unit}".rstrip()
+            reset_val = format_reset(window.resets_at) if window.resets_at else "-"
+            pct = window.used_percent
+            bar = progress_bar(pct, color=theme if color else None)
+            usage_str = f"{bar} ({pct:.0f}%)"
+            rows.append({
+                "service": service_name,
+                "provider": result.provider,
+                "quota": window.label,
+                "usage": usage_str,
+                "details": details,
+                "reset": reset_val,
+                "theme": theme or "",
+            })
+
+    if not rows:
+        lines.append("No quota data to display.")
+        return "\n".join(lines)
+
+    col_widths = [display_width(h) for h in headers]
+    for r in rows:
+        col_widths[0] = max(col_widths[0], display_width(r["service"]))
+        col_widths[1] = max(col_widths[1], display_width(r["quota"]))
+        col_widths[2] = max(col_widths[2], display_width(r["usage"]))
+        col_widths[3] = max(col_widths[3], display_width(r["details"]))
+        col_widths[4] = max(col_widths[4], display_width(r["reset"]))
+
+    def sep(left: str, mid: str, right: str, cross: str) -> str:
+        return left + cross.join("─" * (w + 2) for w in col_widths) + right
+
+    lines.append(sep("┌", "─", "┐", "┬"))
+    lines.append("│ " + " │ ".join(pad(h, w) for h, w in zip(headers, col_widths)) + " │")
+    lines.append(sep("├", "─", "┤", "┼"))
+
+    prev_service = None
+    for i, r in enumerate(rows):
+        serv = r["service"]
+        theme = r["theme"]
+        if prev_service is not None and serv != prev_service:
+            lines.append(sep("├", "─", "┤", "┼"))
+        prev_service = serv
+
+        is_first = (i == 0 or rows[i - 1]["service"] != serv)
+        display_service = serv if is_first else ""
+        if display_service and theme:
+            display_service = f"{theme}{display_service}{RESET}"
+
+        display_quota = r["quota"]
+        if theme and not r["quota"].startswith("unavailable"):
+            display_quota = f"{theme}{display_quota}{RESET}"
+
+        cells = [
+            pad(display_service, col_widths[0]),
+            pad(display_quota, col_widths[1]),
+            pad(r["usage"], col_widths[2]),
+            pad(r["details"], col_widths[3]),
+            pad(r["reset"], col_widths[4]),
+        ]
+        lines.append("│ " + " │ ".join(cells) + " │")
+
+    lines.append(sep("└", "─", "┘", "┴"))
     return "\n".join(lines)
 
 

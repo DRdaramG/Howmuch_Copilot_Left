@@ -447,8 +447,11 @@ class RenderingTests(unittest.TestCase):
 
         output = main.render([result])
 
-        self.assertIn("■■■■□□□□□□ (40%)", output)
+        self.assertIn("████░░░░░░ (40%)", output)
         self.assertIn("600/1500 credits", output)
+        self.assertIn("┌", output)
+        self.assertIn("├", output)
+        self.assertIn("└", output)
 
     def test_provider_failure_does_not_abort_output(self):
         output = main.render([api.QuotaResult("Claude", error="not logged in")])
@@ -464,8 +467,10 @@ class RenderingTests(unittest.TestCase):
 
         output = main.render([result])
 
-        self.assertIn("Ollama (Pro) weekly", output)
-        self.assertIn("resets Friday", output)
+        self.assertIn("Ollama (Pro)", output)
+        self.assertIn("weekly", output)
+        self.assertIn("Friday", output)
+
 
     def test_reset_is_rendered_in_local_24_hour_time(self):
         local = timezone(timedelta(hours=9))
