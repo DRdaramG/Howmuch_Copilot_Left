@@ -14,8 +14,19 @@ class QuotaParsingTests(unittest.TestCase):
     def setUp(self):
         api._MEMORY_CACHE.clear()
         api._COOLDOWNS.clear()
+        self._temp_cache_dir = tempfile.TemporaryDirectory()
+        self._orig_cache_dir = api.CACHE_DIR
+        self._orig_cache_file = api.CACHE_FILE
+        api.CACHE_DIR = Path(self._temp_cache_dir.name)
+        api.CACHE_FILE = api.CACHE_DIR / "cache.json"
+
+    def tearDown(self):
+        api.CACHE_DIR = self._orig_cache_dir
+        api.CACHE_FILE = self._orig_cache_file
+        self._temp_cache_dir.cleanup()
 
     @patch("api.subprocess.run")
+
 
     @patch("api._request_json")
     def test_copilot_ai_credits(self, request_json, run):
@@ -148,10 +159,28 @@ class QuotaParsingTests(unittest.TestCase):
             "429 Client Error: Too Many Requests", response=err_response
         )
 
-        second_result = api.fetch_claude({})
+        second_result = api.fetch_claude({"cache_ttl": 0})
         self.assertIsNone(second_result.error)
         self.assertEqual([w.used_percent for w in second_result.windows], [20, 50])
         self.assertIn("cached", second_result.plan or "")
+        self.assertGreater(api._COOLDOWNS["claude"], 0)
+
+    @patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "test-token"}, clear=False)
+    @patch("api._request_json")
+    def test_claude_cached_within_5_minutes_avoids_api_call(self, request_json):
+        request_json.return_value = {
+            "five_hour": {"utilization": 15},
+            "seven_day": {"utilization": 45},
+        }
+
+        first = api.fetch_claude({})
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual([w.used_percent for w in first.windows], [15, 45])
+
+        # Second call within 5-minute TTL should reuse cache without making API call
+        second = api.fetch_claude({})
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual([w.used_percent for w in second.windows], [15, 45])
 
     @patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "test-token"}, clear=False)
     @patch("api.Path.exists", return_value=False)
@@ -167,6 +196,7 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertIn("rate limited", result.error or "")
 
     @patch.dict(os.environ, {"CODEX_ACCESS_TOKEN": "test-token"}, clear=False)
+
 
     @patch("api._request_json")
     def test_codex_separates_codex_chatgpt_and_review_limits(self, request_json):

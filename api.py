@@ -17,6 +17,8 @@ import requests
 
 TIMEOUT = 15
 AGY_TIMEOUT = 45
+CACHE_TTL = 300
+COOLDOWN_SECONDS = 300
 OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
 OLLAMA_ACCOUNT_URL = "https://ollama.com/api/me"
 OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
@@ -29,6 +31,7 @@ CACHE_FILE = CACHE_DIR / "cache.json"
 
 _MEMORY_CACHE: dict[str, dict] = {}
 _COOLDOWNS: dict[str, float] = {}
+
 
 
 
@@ -55,6 +58,13 @@ def _number(value: Any) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _clean_plan(plan: str | None) -> str | None:
+    if not plan:
+        return None
+    cleaned = re.sub(r"\s*\(?\s*cached\s*\)?", "", plan, flags=re.IGNORECASE).rstrip(" ,()")
+    return cleaned or None
 
 
 def _load_cache(provider: str) -> QuotaResult | None:
@@ -86,9 +96,24 @@ def _load_cache(provider: str) -> QuotaResult | None:
                 provider=cached.get("provider", provider.title()),
                 windows=windows,
                 error=None,
-                plan=cached.get("plan"),
+                plan=_clean_plan(cached.get("plan")),
             )
     return None
+
+
+def _get_cached_time(provider: str) -> float:
+    cached = _MEMORY_CACHE.get(provider)
+    if not cached and CACHE_FILE.exists():
+        try:
+            full_cache = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(full_cache, dict) and provider in full_cache:
+                cached = full_cache[provider]
+                _MEMORY_CACHE[provider] = cached
+        except (OSError, json.JSONDecodeError):
+            pass
+    if isinstance(cached, dict):
+        return float(cached.get("cached_at", 0.0))
+    return 0.0
 
 
 def _save_cache(provider: str, result: QuotaResult) -> None:
@@ -96,7 +121,7 @@ def _save_cache(provider: str, result: QuotaResult) -> None:
         return
     data = {
         "provider": result.provider,
-        "plan": result.plan,
+        "plan": _clean_plan(result.plan),
         "windows": [
             {
                 "label": w.label,
@@ -360,9 +385,19 @@ def fetch_claude(settings: dict) -> QuotaResult:
     now = time.time()
     cooldown = _COOLDOWNS.get("claude", 0.0)
     cached = _load_cache("claude")
+    cached_at = _get_cached_time("claude")
+    ttl = (
+        _number(settings["cache_ttl"])
+        if "cache_ttl" in settings and _number(settings["cache_ttl"]) is not None
+        else CACHE_TTL
+    )
 
-    if now < cooldown and cached:
-        plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+    if cached and (now < cooldown or (now - cached_at < ttl)):
+        plan = (
+            f"{cached.plan}, cached"
+            if cached.plan and "cached" not in str(cached.plan)
+            else (cached.plan or "cached")
+        )
         return QuotaResult(cached.provider, cached.windows, None, plan)
 
     try:
@@ -375,19 +410,27 @@ def fetch_claude(settings: dict) -> QuotaResult:
     except requests.HTTPError as exc:
         is_429 = (exc.response is not None and exc.response.status_code == 429) or "429" in str(exc)
         if is_429:
-            _COOLDOWNS["claude"] = now + 120
+            _COOLDOWNS["claude"] = now + COOLDOWN_SECONDS
             if cached:
-                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                plan = (
+                    f"{cached.plan}, cached"
+                    if cached.plan and "cached" not in str(cached.plan)
+                    else (cached.plan or "cached")
+                )
                 return QuotaResult(cached.provider, cached.windows, None, plan)
-            return QuotaResult("Claude", error="rate limited (HTTP 429; retry later)")
+            return QuotaResult("Claude", error="rate limited (HTTP 429; retry in 5 minutes)")
         raise
     except requests.RequestException as exc:
         if "429" in str(exc) or "rate" in str(exc).lower():
-            _COOLDOWNS["claude"] = now + 120
+            _COOLDOWNS["claude"] = now + COOLDOWN_SECONDS
             if cached:
-                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                plan = (
+                    f"{cached.plan}, cached"
+                    if cached.plan and "cached" not in str(cached.plan)
+                    else (cached.plan or "cached")
+                )
                 return QuotaResult(cached.provider, cached.windows, None, plan)
-            return QuotaResult("Claude", error="rate limited (HTTP 429; retry later)")
+            return QuotaResult("Claude", error="rate limited (HTTP 429; retry in 5 minutes)")
         raise
 
     windows = []
@@ -813,19 +856,21 @@ def fetch_provider(name: str, settings: dict) -> QuotaResult:
     except requests.HTTPError as exc:
         is_429 = (exc.response is not None and exc.response.status_code == 429) or "429" in str(exc)
         if is_429:
+            _COOLDOWNS[name] = time.time() + COOLDOWN_SECONDS
             cached = _load_cache(name)
             if cached:
-                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                plan = f"{cached.plan}, cached" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
                 return QuotaResult(cached.provider, cached.windows, None, plan)
-            return QuotaResult(name.title(), error="rate limited (HTTP 429; retry later)")
+            return QuotaResult(name.title(), error="rate limited (HTTP 429; retry in 5 minutes)")
         return QuotaResult(name.title(), error=f"request failed: {exc}")
     except requests.RequestException as exc:
         if "429" in str(exc) or "rate" in str(exc).lower():
+            _COOLDOWNS[name] = time.time() + COOLDOWN_SECONDS
             cached = _load_cache(name)
             if cached:
-                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                plan = f"{cached.plan}, cached" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
                 return QuotaResult(cached.provider, cached.windows, None, plan)
-            return QuotaResult(name.title(), error="rate limited (HTTP 429; retry later)")
+            return QuotaResult(name.title(), error="rate limited (HTTP 429; retry in 5 minutes)")
         return QuotaResult(name.title(), error=f"request failed: {exc}")
     except (TypeError, ValueError, KeyError) as exc:
         return QuotaResult(name.title(), error=f"invalid response: {exc}")
