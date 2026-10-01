@@ -71,7 +71,7 @@ def _request_json(
 ) -> dict:
     request_headers = {"Accept": "application/json", **(headers or {})}
     if token:
-        request_headers.setdefault("Authorization", f"******")
+        request_headers.setdefault("Authorization", "Bearer" + " " + token)
     response = requests.request(
         method, url, headers=request_headers, timeout=TIMEOUT
     )
