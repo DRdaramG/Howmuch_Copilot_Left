@@ -49,8 +49,8 @@ python main.py --no-clear
 ```
 
 `Ctrl+C`로 종료합니다. 갱신을 기다리는 동안 `Ctrl+S`를 누르면 대화형 설정 메뉴가
-열립니다. 메뉴에서 API 주소 추가, Codex/Claude OAuth 연결, API 키 등록, 서비스
-활성화, 갱신 주기 변경을 할 수 있으며 완료하면 즉시 새 설정을 적용합니다.
+열립니다. 메뉴에서 GitHub/Codex/Claude 웹 인증, API 키 등록, 서비스 활성화, 갱신
+주기 변경을 할 수 있으며 인증이나 키 등록에 성공한 서비스는 자동으로 활성화됩니다.
 
 ## 인증
 
@@ -58,7 +58,7 @@ python main.py --no-clear
 
 | 서비스 | 인증 방법 |
 |---|---|
-| Copilot | `COPILOT_TOKEN` (또는 `GITHUB_TOKEN`) |
+| Copilot | `gh auth login --web`으로 GitHub 웹 인증 |
 | Codex | `codex login`으로 생성한 `~/.codex/auth.json`, 또는 `CODEX_ACCESS_TOKEN` |
 | Claude | Claude Code의 `~/.claude/.credentials.json`, 또는 `CLAUDE_ACCESS_TOKEN` |
 | NanoGPT | `NANOGPT_API_KEY` |
@@ -69,7 +69,7 @@ python main.py --no-clear
 예:
 
 ```bash
-export COPILOT_TOKEN='...'
+gh auth login --web
 export NANOGPT_API_KEY='...'
 export OLLAMA_API_KEY='...'
 export ANTIGRAVITY_ACCESS_TOKEN='...'
