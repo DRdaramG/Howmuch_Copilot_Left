@@ -101,12 +101,11 @@ def main(argv: list[str] | None = None) -> int:
                     print("\033[2J\033[H", end="")
                 print(render(results), flush=True)
                 if not args.once and sys.stdin.isatty():
-                    print("\nCtrl+S: settings", flush=True)
+                    print("\nCtrl+S: 설정 메뉴", flush=True)
             if args.once or args.json:
                 return 0
             if wait_for_refresh(interval):
-                config.edit()
-                settings = config.load()
+                settings = config.menu()
                 interval = args.interval or int(
                     settings.get("refresh_interval_seconds", 60)
                 )

@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import api
 import config
@@ -156,15 +156,55 @@ class RenderingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    @patch.dict(os.environ, {"EDITOR": "true"}, clear=False)
-    def test_edit_creates_private_default_config(self):
+    def test_menu_registers_key_in_private_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
+            answers = iter(["3", "4", "0"])
 
-            config.edit(path)
+            settings = config.menu(
+                path,
+                input_fn=lambda _: next(answers),
+                secret_input_fn=lambda _: "test-key",
+                output_fn=lambda _: None,
+            )
 
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertIn("antigravity", config.load(path)["providers"])
+            self.assertEqual(settings["providers"]["nanogpt"]["token"], "test-key")
+            self.assertTrue(settings["providers"]["nanogpt"]["enabled"])
+
+    def test_menu_sets_api_url_and_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            answers = iter(["1", "5", "https://example.test/usage", "5", "30", "0"])
+
+            settings = config.menu(
+                path,
+                input_fn=lambda _: next(answers),
+                output_fn=lambda _: None,
+            )
+
+            self.assertEqual(
+                settings["providers"]["ollama"]["url"],
+                "https://example.test/usage",
+            )
+            self.assertTrue(settings["providers"]["ollama"]["enabled"])
+            self.assertEqual(settings["refresh_interval_seconds"], 30)
+
+    def test_menu_runs_oauth_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            answers = iter(["2", "1", "0"])
+            run = Mock(return_value=Mock(returncode=0))
+
+            settings = config.menu(
+                path,
+                input_fn=lambda _: next(answers),
+                output_fn=lambda _: None,
+                run_fn=run,
+            )
+
+            run.assert_called_once_with(["codex", "login"], check=False)
+            self.assertTrue(settings["providers"]["codex"]["enabled"])
 
 
 if __name__ == "__main__":
