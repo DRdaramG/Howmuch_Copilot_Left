@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +20,16 @@ AGY_TIMEOUT = 45
 OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
 OLLAMA_ACCOUNT_URL = "https://ollama.com/api/me"
 OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
+
+CACHE_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    / "howmuch-left"
+)
+CACHE_FILE = CACHE_DIR / "cache.json"
+
+_MEMORY_CACHE: dict[str, dict] = {}
+_COOLDOWNS: dict[str, float] = {}
+
 
 
 @dataclass
@@ -44,6 +55,84 @@ def _number(value: Any) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _load_cache(provider: str) -> QuotaResult | None:
+    cached = _MEMORY_CACHE.get(provider)
+    if not cached and CACHE_FILE.exists():
+        try:
+            full_cache = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(full_cache, dict) and provider in full_cache:
+                cached = full_cache[provider]
+                _MEMORY_CACHE[provider] = cached
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    if isinstance(cached, dict):
+        windows = [
+            QuotaWindow(
+                label=w.get("label", ""),
+                used_percent=float(w.get("used_percent", 0.0)),
+                used=_number(w.get("used")),
+                total=_number(w.get("total")),
+                unit=str(w.get("unit", "")),
+                resets_at=w.get("resets_at"),
+            )
+            for w in cached.get("windows", [])
+            if isinstance(w, dict)
+        ]
+        if windows:
+            return QuotaResult(
+                provider=cached.get("provider", provider.title()),
+                windows=windows,
+                error=None,
+                plan=cached.get("plan"),
+            )
+    return None
+
+
+def _save_cache(provider: str, result: QuotaResult) -> None:
+    if not result.windows or result.error:
+        return
+    data = {
+        "provider": result.provider,
+        "plan": result.plan,
+        "windows": [
+            {
+                "label": w.label,
+                "used_percent": w.used_percent,
+                "used": w.used,
+                "total": w.total,
+                "unit": w.unit,
+                "resets_at": w.resets_at,
+            }
+            for w in result.windows
+        ],
+        "cached_at": time.time(),
+    }
+    _MEMORY_CACHE[provider] = data
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        full_cache = {}
+        if CACHE_FILE.exists():
+            try:
+                full_cache = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+                if not isinstance(full_cache, dict):
+                    full_cache = {}
+            except (OSError, json.JSONDecodeError):
+                full_cache = {}
+        full_cache[provider] = data
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=CACHE_DIR, delete=False
+        ) as temp:
+            json.dump(full_cache, temp, ensure_ascii=False, indent=2)
+            temp.write("\n")
+            temp_path = Path(temp.name)
+        temp_path.chmod(0o600)
+        temp_path.replace(CACHE_FILE)
+    except OSError:
+        pass
+
 
 
 def _window(
@@ -267,12 +356,40 @@ def fetch_claude(settings: dict) -> QuotaResult:
     token = _secret(settings, "CLAUDE_ACCESS_TOKEN") or oauth.get("accessToken")
     if not token:
         return QuotaResult("Claude", error="set CLAUDE_ACCESS_TOKEN or log in with Claude Code")
-    data = _request_json(
-        "GET",
-        settings.get("url", "https://api.anthropic.com/api/oauth/usage"),
-        token,
-        {"anthropic-beta": "oauth-2025-04-20"},
-    )
+
+    now = time.time()
+    cooldown = _COOLDOWNS.get("claude", 0.0)
+    cached = _load_cache("claude")
+
+    if now < cooldown and cached:
+        plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+        return QuotaResult(cached.provider, cached.windows, None, plan)
+
+    try:
+        data = _request_json(
+            "GET",
+            settings.get("url", "https://api.anthropic.com/api/oauth/usage"),
+            token,
+            {"anthropic-beta": "oauth-2025-04-20"},
+        )
+    except requests.HTTPError as exc:
+        is_429 = (exc.response is not None and exc.response.status_code == 429) or "429" in str(exc)
+        if is_429:
+            _COOLDOWNS["claude"] = now + 120
+            if cached:
+                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                return QuotaResult(cached.provider, cached.windows, None, plan)
+            return QuotaResult("Claude", error="rate limited (HTTP 429; retry later)")
+        raise
+    except requests.RequestException as exc:
+        if "429" in str(exc) or "rate" in str(exc).lower():
+            _COOLDOWNS["claude"] = now + 120
+            if cached:
+                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                return QuotaResult(cached.provider, cached.windows, None, plan)
+            return QuotaResult("Claude", error="rate limited (HTTP 429; retry later)")
+        raise
+
     windows = []
     labels = set()
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -330,12 +447,15 @@ def fetch_claude(settings: dict) -> QuotaResult:
                 windows.append(window)
                 labels.add(label)
     plan = oauth.get("subscriptionType")
-    return QuotaResult(
+    result = QuotaResult(
         "Claude",
         windows,
         None if windows else "unknown usage format",
         str(plan) if plan else None,
     )
+    if windows:
+        _save_cache("claude", result)
+    return result
 
 
 def fetch_nanogpt(settings: dict) -> QuotaResult:
@@ -686,8 +806,26 @@ def fetch_provider(name: str, settings: dict) -> QuotaResult:
     if fetcher is None:
         return QuotaResult(name, error="unsupported provider")
     try:
-        return fetcher(settings)
+        result = fetcher(settings)
+        if result.windows and not result.error:
+            _save_cache(name, result)
+        return result
+    except requests.HTTPError as exc:
+        is_429 = (exc.response is not None and exc.response.status_code == 429) or "429" in str(exc)
+        if is_429:
+            cached = _load_cache(name)
+            if cached:
+                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                return QuotaResult(cached.provider, cached.windows, None, plan)
+            return QuotaResult(name.title(), error="rate limited (HTTP 429; retry later)")
+        return QuotaResult(name.title(), error=f"request failed: {exc}")
     except requests.RequestException as exc:
+        if "429" in str(exc) or "rate" in str(exc).lower():
+            cached = _load_cache(name)
+            if cached:
+                plan = f"{cached.plan} (cached)" if cached.plan and "cached" not in str(cached.plan) else (cached.plan or "cached")
+                return QuotaResult(cached.provider, cached.windows, None, plan)
+            return QuotaResult(name.title(), error="rate limited (HTTP 429; retry later)")
         return QuotaResult(name.title(), error=f"request failed: {exc}")
     except (TypeError, ValueError, KeyError) as exc:
         return QuotaResult(name.title(), error=f"invalid response: {exc}")

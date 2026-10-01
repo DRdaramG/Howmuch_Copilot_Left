@@ -11,7 +11,12 @@ import main
 
 
 class QuotaParsingTests(unittest.TestCase):
+    def setUp(self):
+        api._MEMORY_CACHE.clear()
+        api._COOLDOWNS.clear()
+
     @patch("api.subprocess.run")
+
     @patch("api._request_json")
     def test_copilot_ai_credits(self, request_json, run):
         run.return_value = Mock(returncode=0, stdout="test-token\n")
@@ -125,7 +130,44 @@ class QuotaParsingTests(unittest.TestCase):
             [window.label for window in result.windows], ["7d Opus", "7d Fable"]
         )
 
+    @patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "test-token"}, clear=False)
+    @patch("api._request_json")
+    def test_claude_rate_limit_fallback_to_cache(self, request_json):
+        import requests
+        request_json.return_value = {
+            "five_hour": {"utilization": 20, "resets_at": "soon"},
+            "seven_day": {"utilization": 50},
+        }
+
+        first_result = api.fetch_claude({})
+        self.assertIsNone(first_result.error)
+        self.assertEqual(len(first_result.windows), 2)
+
+        err_response = Mock(status_code=429)
+        request_json.side_effect = requests.HTTPError(
+            "429 Client Error: Too Many Requests", response=err_response
+        )
+
+        second_result = api.fetch_claude({})
+        self.assertIsNone(second_result.error)
+        self.assertEqual([w.used_percent for w in second_result.windows], [20, 50])
+        self.assertIn("cached", second_result.plan or "")
+
+    @patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "test-token"}, clear=False)
+    @patch("api.Path.exists", return_value=False)
+    @patch("api._request_json")
+    def test_claude_rate_limit_without_cache(self, request_json, path_exists):
+        import requests
+        err_response = Mock(status_code=429)
+        request_json.side_effect = requests.HTTPError(
+            "429 Client Error: Too Many Requests", response=err_response
+        )
+
+        result = api.fetch_claude({})
+        self.assertIn("rate limited", result.error or "")
+
     @patch.dict(os.environ, {"CODEX_ACCESS_TOKEN": "test-token"}, clear=False)
+
     @patch("api._request_json")
     def test_codex_separates_codex_chatgpt_and_review_limits(self, request_json):
         window = {
