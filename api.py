@@ -186,26 +186,49 @@ def fetch_codex(settings: dict) -> QuotaResult:
             raise
         token = _refresh_codex_auth(auth_path, auth)
         data = _request_json("GET", url, token, headers)
-    rate_limit = data.get("rate_limit") or {}
+    windows = _codex_rate_windows(data.get("rate_limit"), "Codex")
+    windows.extend(
+        _codex_rate_windows(data.get("code_review_rate_limit"), "code review")
+    )
+    additional = data.get("additional_rate_limits")
+    if isinstance(additional, list):
+        for value in additional:
+            if isinstance(value, dict):
+                label = str(value.get("limit_name") or "additional")
+                windows.extend(_codex_rate_windows(value.get("rate_limit"), label))
+    chatpass = data.get("chatpass")
+    if isinstance(chatpass, dict) and isinstance(chatpass.get("windows"), list):
+        for value in chatpass["windows"]:
+            window = _codex_window(value, "ChatGPT")
+            if window:
+                windows.append(window)
+    plan = str(data["plan_type"]) if data.get("plan_type") else None
+    return QuotaResult(
+        "Codex", windows, None if windows else "unknown usage format", plan
+    )
+
+
+def _codex_rate_windows(value: Any, prefix: str) -> list[QuotaWindow]:
+    if not isinstance(value, dict):
+        return []
     windows = []
-    for name, value in (
-        ("session", rate_limit.get("primary_window")),
-        ("weekly", rate_limit.get("secondary_window")),
-    ):
-        if not isinstance(value, dict):
-            continue
-        label = name
-        seconds = _number(value.get("limit_window_seconds"))
-        if seconds and seconds >= 3 * 86400:
-            label = "weekly"
-        window = _window(
-            label,
-            percent=value.get("used_percent"),
-            reset=value.get("reset_at"),
-        )
+    for candidate in (value.get("primary_window"), value.get("secondary_window")):
+        window = _codex_window(candidate, prefix)
         if window:
             windows.append(window)
-    return QuotaResult("Codex", windows, None if windows else "unknown usage format")
+    return windows
+
+
+def _codex_window(value: Any, prefix: str) -> QuotaWindow | None:
+    if not isinstance(value, dict):
+        return None
+    seconds = _number(value.get("limit_window_seconds"))
+    period = "weekly" if seconds and seconds >= 3 * 86400 else "5h"
+    return _window(
+        f"{prefix} {period}",
+        percent=value.get("used_percent"),
+        reset=value.get("reset_at"),
+    )
 
 
 def fetch_claude(settings: dict) -> QuotaResult:
@@ -221,6 +244,7 @@ def fetch_claude(settings: dict) -> QuotaResult:
         {"anthropic-beta": "oauth-2025-04-20"},
     )
     windows = []
+    labels = set()
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         value = data.get(key)
         if isinstance(value, dict):
@@ -231,17 +255,47 @@ def fetch_claude(settings: dict) -> QuotaResult:
             )
             if window:
                 windows.append(window)
+                labels.add(label)
+    for key, label in (
+        ("seven_day_opus", "7d Opus"),
+        ("seven_day_sonnet", "7d Sonnet"),
+    ):
+        value = data.get(key)
+        if isinstance(value, dict) and _number(value.get("utilization")):
+            window = _window(
+                label,
+                percent=value.get("utilization"),
+                reset=value.get("resets_at"),
+            )
+            if window:
+                windows.append(window)
+                labels.add(label)
     limits = data.get("limits")
     if isinstance(limits, list):
         for value in limits:
             if not isinstance(value, dict):
                 continue
             kind = value.get("kind", "quota")
-            label = {"session": "5h", "weekly_all": "7d"}.get(kind, str(kind))
+            label = {
+                "session": "5h",
+                "weekly_all": "7d",
+                "weekly_model": "7d model",
+                "weekly_scoped": "7d scoped",
+            }.get(kind, str(kind))
+            percent = _number(value.get("percent"))
+            if label in labels or not percent:
+                continue
             window = _window(label, percent=value.get("percent"), reset=value.get("resets_at"))
             if window:
                 windows.append(window)
-    return QuotaResult("Claude", windows, None if windows else "unknown usage format")
+                labels.add(label)
+    plan = oauth.get("subscriptionType")
+    return QuotaResult(
+        "Claude",
+        windows,
+        None if windows else "unknown usage format",
+        str(plan) if plan else None,
+    )
 
 
 def fetch_nanogpt(settings: dict) -> QuotaResult:

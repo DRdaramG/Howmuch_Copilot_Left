@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from datetime import timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -34,12 +35,43 @@ class QuotaParsingTests(unittest.TestCase):
         request_json.return_value = {
             "five_hour": {"utilization": 25, "resets_at": "soon"},
             "seven_day": {"utilization": 50},
-            "limits": [{"kind": "weekly_model", "percent": 10}],
+            "limits": [
+                {"kind": "session", "percent": 25},
+                {"kind": "weekly_all", "percent": 50},
+                {"kind": "weekly_scoped", "percent": 0},
+                {"kind": "weekly_model", "percent": 10},
+            ],
         }
 
         result = api.fetch_claude({})
 
         self.assertEqual([window.used_percent for window in result.windows], [25, 50, 10])
+        self.assertEqual(
+            [window.label for window in result.windows], ["5h", "7d", "7d model"]
+        )
+
+    @patch.dict(os.environ, {"CODEX_ACCESS_TOKEN": "test-token"}, clear=False)
+    @patch("api._request_json")
+    def test_codex_separates_codex_chatgpt_and_review_limits(self, request_json):
+        window = {
+            "used_percent": 20,
+            "limit_window_seconds": 18000,
+            "reset_at": 1790846400,
+        }
+        request_json.return_value = {
+            "plan_type": "plus",
+            "rate_limit": {"primary_window": window},
+            "code_review_rate_limit": {"primary_window": {**window, "used_percent": 30}},
+            "chatpass": {"windows": [{**window, "used_percent": 40}]},
+        }
+
+        result = api.fetch_codex({})
+
+        self.assertEqual(result.plan, "plus")
+        self.assertEqual(
+            [item.label for item in result.windows],
+            ["Codex 5h", "code review 5h", "ChatGPT 5h"],
+        )
 
     @patch.dict(os.environ, {"DEVPASS_API_KEY": "test-token"}, clear=False)
     @patch("api._request_json")
@@ -153,6 +185,21 @@ class RenderingTests(unittest.TestCase):
 
         self.assertIn("Ollama (Pro) weekly", output)
         self.assertIn("resets Friday", output)
+
+    def test_reset_is_rendered_in_local_24_hour_time(self):
+        local = timezone(timedelta(hours=9))
+
+        output = main.format_reset("2026-10-01T09:20:00+00:00", local)
+
+        self.assertEqual(output, "2026-10-01 18:20")
+
+    def test_provider_theme_wraps_output(self):
+        result = api.QuotaResult("Claude", [api.QuotaWindow("5h", 18)])
+
+        output = main.render([result], color=True)
+
+        self.assertIn(main.PROVIDER_COLORS["claude"], output)
+        self.assertIn(main.RESET, output)
 
 
 class ConfigTests(unittest.TestCase):
