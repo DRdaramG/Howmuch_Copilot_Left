@@ -236,6 +236,53 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertEqual(result.plan, "pro")
 
     @patch.dict(
+        os.environ,
+        {
+            "OLLAMA_API_KEY": "test-token",
+            "OLLAMA_SESSION_COOKIE": "__Secure-session=test",
+        },
+        clear=True,
+    )
+    @patch("api.requests.get")
+    @patch("api._request_json")
+    def test_ollama_merges_cookie_resets_with_api_windows(self, request_json, get):
+        request_json.side_effect = [
+            {
+                "limits": {
+                    "session": {"usage": 0.2},
+                    "weekly": {"usage": 0.3},
+                    "monthly": {"usage": 0.4},
+                }
+            },
+            {"Plan": "pro"},
+        ]
+        get.return_value.status_code = 200
+        get.return_value.is_redirect = False
+        get.return_value.text = """
+            Monthly usage <span>50% used</span>
+            <time data-time="2026-11-01T00:00:00Z"></time>
+        """
+
+        result = api.fetch_ollama({})
+
+        self.assertEqual(
+            [window.label for window in result.windows], ["5h", "weekly", "monthly"]
+        )
+        self.assertEqual(
+            [window.used_percent for window in result.windows], [20, 30, 50]
+        )
+        self.assertEqual(result.windows[2].resets_at, "2026-11-01T00:00:00Z")
+
+    def test_ollama_settings_parses_reset_after_long_markup(self):
+        windows, _ = api._parse_ollama_settings(
+            "Weekly usage <span>0.7% used</span>"
+            + ("<div></div>" * 150)
+            + '<time data-time="2026-10-08T00:00:00Z"></time>'
+        )
+
+        self.assertEqual(windows[0].resets_at, "2026-10-08T00:00:00Z")
+
+    @patch.dict(
         os.environ, {"ANTIGRAVITY_ACCESS_TOKEN": "test-token"}, clear=False
     )
     @patch("api._request_json")

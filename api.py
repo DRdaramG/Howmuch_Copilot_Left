@@ -374,7 +374,15 @@ def fetch_ollama(settings: dict) -> QuotaResult:
                 return QuotaResult("Ollama", api_windows, plan=api_plan)
             raise
         if windows:
-            return QuotaResult("Ollama", windows, plan=plan or api_plan)
+            merged = {window.label: window for window in api_windows}
+            merged.update({window.label: window for window in windows})
+            ordered = [
+                merged.pop(label)
+                for label in ("5h", "weekly", "monthly")
+                if label in merged
+            ]
+            ordered.extend(merged.values())
+            return QuotaResult("Ollama", ordered, plan=plan or api_plan)
         if not api_windows:
             return QuotaResult("Ollama", error=error)
     if api_windows:
@@ -464,7 +472,7 @@ def _parse_ollama_settings(document: str) -> tuple[list[QuotaWindow], str | None
                 end = (
                     len(start.group(0)) + next_label.start()
                     if next_label
-                    else 1200
+                    else 10_000
                 )
                 block = tail[:end]
                 break
