@@ -49,8 +49,8 @@ python main.py --no-clear
 ```
 
 `Ctrl+C`로 종료합니다. 갱신을 기다리는 동안 `Ctrl+S`를 누르면 대화형 설정 메뉴가
-열립니다. 메뉴에서 API 주소 추가, Codex/Claude OAuth 연결, API 키 등록, 서비스
-활성화, 갱신 주기 변경을 할 수 있으며 완료하면 즉시 새 설정을 적용합니다.
+열립니다. 메뉴에서 GitHub/Codex/Claude 웹 인증, API 키 등록, 서비스 활성화, 갱신
+주기 변경을 할 수 있으며 인증이나 키 등록에 성공한 서비스는 자동으로 활성화됩니다.
 
 ## 인증
 
@@ -58,18 +58,18 @@ python main.py --no-clear
 
 | 서비스 | 인증 방법 |
 |---|---|
-| Copilot | `COPILOT_TOKEN` (또는 `GITHUB_TOKEN`) |
+| Copilot | `gh auth login --web`으로 GitHub 웹 인증 |
 | Codex | `codex login`으로 생성한 `~/.codex/auth.json`, 또는 `CODEX_ACCESS_TOKEN` |
 | Claude | Claude Code의 `~/.claude/.credentials.json`, 또는 `CLAUDE_ACCESS_TOKEN` |
 | NanoGPT | `NANOGPT_API_KEY` |
 | Ollama Cloud | `OLLAMA_API_KEY`, 또는 `OLLAMA_SESSION_COOKIE` |
 | Antigravity | `ANTIGRAVITY_ACCESS_TOKEN` |
-| DevPass | `DEVPASS_API_KEY` |
+| DevPass | `DEVPASS_API_KEY`, 또는 `DEVPASS_SESSION_COOKIE` |
 
 예:
 
 ```bash
-export COPILOT_TOKEN='...'
+gh auth login --web
 export NANOGPT_API_KEY='...'
 export OLLAMA_API_KEY='...'
 export ANTIGRAVITY_ACCESS_TOKEN='...'
@@ -113,6 +113,12 @@ API 키를 사용할 수 없으면 브라우저 개발자 도구에서 `ollama.c
 Antigravity는 계정에 제공된 할당량 API 또는 호환 프록시 주소를
 `ANTIGRAVITY_USAGE_URL`(또는 설정의 `url`)로 지정해야 합니다. 응답의 요금제와
 5시간·일간·주간·월간 한도 및 초기화 시각을 인식해 표시합니다.
+
+DevPass는 API 키로 공식 `GET /v1/key` 사용량 API를 조회합니다. 또는
+`https://devpass.llmgateway.io/dashboard/usage`에 로그인한 브라우저의
+`better-auth.session_token` 쿠키 전체 값을 `DEVPASS_SESSION_COOKIE`로 지정하면
+대시보드가 사용하는 상태 API에서 월간 및 프리미엄 주간 사용량을 읽습니다. 세션
+쿠키는 비밀번호처럼 취급하고 환경 변수로만 전달하는 것을 권장합니다.
 
 ## 테스트
 

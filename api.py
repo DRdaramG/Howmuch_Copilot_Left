@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,8 @@ TIMEOUT = 15
 OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
 OLLAMA_ACCOUNT_URL = "https://ollama.com/api/me"
 OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
+DEVPASS_DASHBOARD_URL = "https://devpass.llmgateway.io/dashboard/usage"
+DEVPASS_STATUS_URL = "https://api.llmgateway.io/dev-plans/status"
 
 
 @dataclass
@@ -143,10 +146,26 @@ def _refresh_codex_auth(path: Path, auth: dict) -> str:
     return str(access_token)
 
 
+def _github_token() -> str | None:
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token", "--hostname", "github.com"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    token = result.stdout.strip()
+    return token if result.returncode == 0 and token else None
+
+
 def fetch_copilot(settings: dict) -> QuotaResult:
-    token = _secret(settings, "COPILOT_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    token = _github_token()
     if not token:
-        return QuotaResult("Copilot", error="set COPILOT_TOKEN")
+        return QuotaResult(
+            "Copilot", error="connect GitHub from the settings menu (`gh auth login --web`)"
+        )
     data = _request_json(
         "GET",
         settings.get("url", "https://api.github.com/copilot_internal/user"),
@@ -320,14 +339,21 @@ def fetch_nanogpt(settings: dict) -> QuotaResult:
     data = _request_json(
         "GET",
         settings.get("url", "https://nano-gpt.com/api/subscription/v1/usage"),
+        token,
         headers={"x-api-key": token},
     )
     windows = []
-    for key, label, unit in (
+    legacy_windows = (
         ("dailyInputTokens", "daily", "tokens"),
         ("weeklyInputTokens", "weekly", "tokens"),
         ("dailyImages", "daily images", "images"),
-    ):
+    )
+    current_windows = (
+        ("daily", "daily", ""),
+        ("monthly", "monthly", ""),
+    )
+    limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
+    for key, label, unit in legacy_windows + current_windows:
         value = data.get(key)
         if not isinstance(value, dict):
             continue
@@ -337,11 +363,16 @@ def fetch_nanogpt(settings: dict) -> QuotaResult:
         window = _window(
             label,
             used=value.get("used"),
-            total=(data.get("limits") or {}).get(key),
+            total=value.get("limit", limits.get(key)),
             percent=percent,
             remaining=value.get("remaining"),
             unit=unit,
-            reset=value.get("resetAt"),
+            reset=value.get("resetAt")
+            or (
+                (data.get("period") or {}).get("currentPeriodEnd")
+                if key == "monthly" and isinstance(data.get("period"), dict)
+                else None
+            ),
         )
         if window:
             windows.append(window)
@@ -640,15 +671,40 @@ def _quota_windows(data: dict) -> list[QuotaWindow]:
 
 def fetch_devpass(settings: dict) -> QuotaResult:
     token = _secret(settings, "DEVPASS_API_KEY")
-    if not token:
-        return QuotaResult("DevPass", error="set DEVPASS_API_KEY")
-    payload = _request_json(
-        "GET", settings.get("url", "https://api.llmgateway.io/v1/key"), token
+    session_cookie = settings.get("session_cookie") or os.environ.get(
+        "DEVPASS_SESSION_COOKIE"
     )
+    if session_cookie:
+        response = requests.get(
+            DEVPASS_STATUS_URL,
+            headers={
+                "Accept": "application/json",
+                "Cookie": str(session_cookie),
+                "User-Agent": "howmuch-left/1",
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("dashboard returned a non-object response")
+    elif token:
+        payload = _request_json(
+            "GET", settings.get("url", "https://api.llmgateway.io/v1/key"), token
+        )
+    else:
+        return QuotaResult(
+            "DevPass", error="set DEVPASS_API_KEY or DEVPASS_SESSION_COOKIE"
+        )
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     windows = []
     for label, used_key, limit_key, reset_key in (
-        ("credits", "devPlanCreditsUsed", "devPlanCreditsLimit", None),
+        (
+            "monthly",
+            "devPlanCreditsUsed",
+            "devPlanCreditsLimit",
+            "devPlanExpiresAt",
+        ),
         (
             "premium weekly",
             "devPlanPremiumCreditsUsed",
@@ -669,7 +725,13 @@ def fetch_devpass(settings: dict) -> QuotaResult:
         window = _window("usage", used=data.get("usage"), total=data.get("limit"))
         if window:
             windows.append(window)
-    return QuotaResult("DevPass", windows, None if windows else "unknown usage format")
+    plan = data.get("devPlan")
+    return QuotaResult(
+        "DevPass",
+        windows,
+        None if windows else "unknown usage format",
+        str(plan) if plan and plan != "none" else None,
+    )
 
 
 PROVIDERS: dict[str, Callable[[dict], QuotaResult]] = {

@@ -28,12 +28,12 @@ DEFAULTS = {
 }
 
 OAUTH_COMMANDS = {
+    "copilot": ["gh", "auth", "login", "--hostname", "github.com", "--web"],
     "codex": ["codex", "login"],
     "claude": ["claude", "login"],
 }
 
 KEY_NAMES = {
-    "copilot": "COPILOT_TOKEN",
     "codex": "CODEX_ACCESS_TOKEN",
     "claude": "CLAUDE_ACCESS_TOKEN",
     "nanogpt": "NANOGPT_API_KEY",
@@ -109,27 +109,16 @@ def menu(
     settings = load(path)
     while True:
         output_fn("\n설정 메뉴")
-        output_fn("  [1] API 추가/주소 설정")
-        output_fn("  [2] OAuth 연결")
-        output_fn("  [3] API 키 등록")
-        output_fn("  [4] 서비스 켜기/끄기")
-        output_fn("  [5] 갱신 주기 변경")
+        output_fn("  [1] 웹/OAuth 연결")
+        output_fn("  [2] API 키 등록")
+        output_fn("  [3] 서비스 켜기/끄기")
+        output_fn("  [4] 갱신 주기 변경")
         output_fn("  [0] 완료")
         choice = input_fn("선택: ").strip()
 
         if choice == "0":
             return settings
         if choice == "1":
-            provider = _choose_provider(settings, input_fn, output_fn)
-            if provider:
-                current = settings["providers"][provider].get("url", "")
-                url = input_fn(f"API 주소 [{current}]: ").strip()
-                if url:
-                    settings["providers"][provider]["url"] = url
-                settings["providers"][provider]["enabled"] = True
-                save(settings, path)
-                output_fn(f"{provider} API 설정을 저장했습니다.")
-        elif choice == "2":
             provider = _choose_provider(
                 settings, input_fn, output_fn, set(OAUTH_COMMANDS)
             )
@@ -145,8 +134,10 @@ def menu(
                     output_fn(f"{provider} OAuth 연결을 완료했습니다.")
                 else:
                     output_fn(f"{provider} OAuth 연결에 실패했습니다.")
-        elif choice == "3":
-            provider = _choose_provider(settings, input_fn, output_fn)
+        elif choice == "2":
+            provider = _choose_provider(
+                settings, input_fn, output_fn, set(KEY_NAMES)
+            )
             if provider:
                 token = secret_input_fn(f"{KEY_NAMES[provider]}: ").strip()
                 if token:
@@ -154,7 +145,7 @@ def menu(
                     settings["providers"][provider]["enabled"] = True
                     save(settings, path)
                     output_fn(f"{provider} 키를 저장했습니다.")
-        elif choice == "4":
+        elif choice == "3":
             provider = _choose_provider(settings, input_fn, output_fn)
             if provider:
                 values = settings["providers"][provider]
@@ -162,7 +153,7 @@ def menu(
                 save(settings, path)
                 state = "켰습니다" if values["enabled"] else "껐습니다"
                 output_fn(f"{provider} 서비스를 {state}.")
-        elif choice == "5":
+        elif choice == "4":
             value = input_fn("갱신 주기(초): ").strip()
             try:
                 interval = int(value)

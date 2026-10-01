@@ -11,9 +11,10 @@ import main
 
 
 class QuotaParsingTests(unittest.TestCase):
-    @patch.dict(os.environ, {"COPILOT_TOKEN": "test-token"}, clear=False)
+    @patch("api.subprocess.run")
     @patch("api._request_json")
-    def test_copilot_ai_credits(self, request_json):
+    def test_copilot_ai_credits(self, request_json, run):
+        run.return_value = Mock(returncode=0, stdout="test-token\n")
         request_json.return_value = {
             "quota_snapshots": {
                 "ai_credits": {
@@ -28,6 +29,64 @@ class QuotaParsingTests(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertEqual(result.windows[0].used, 600)
         self.assertEqual(result.windows[0].used_percent, 40)
+        run.assert_called_once_with(
+            ["gh", "auth", "token", "--hostname", "github.com"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    @patch("api.subprocess.run", side_effect=FileNotFoundError)
+    def test_copilot_requires_github_cli_login(self, _run):
+        result = api.fetch_copilot({})
+
+        self.assertIn("gh auth login --web", result.error)
+
+    @patch.dict(os.environ, {"NANOGPT_API_KEY": "test-token"}, clear=False)
+    @patch("api._request_json")
+    def test_nanogpt_current_usage_shape(self, request_json):
+        request_json.return_value = {
+            "state": "active",
+            "limits": {"daily": 100, "monthly": 1000},
+            "daily": {
+                "used": 25,
+                "remaining": 75,
+                "percentUsed": 0.25,
+                "resetAt": 1790899200000,
+            },
+            "monthly": {
+                "used": 400,
+                "remaining": 600,
+                "percentUsed": 0.4,
+            },
+            "period": {"currentPeriodEnd": "2026-11-01T00:00:00Z"},
+        }
+
+        result = api.fetch_nanogpt({})
+
+        self.assertEqual([window.label for window in result.windows], ["daily", "monthly"])
+        self.assertEqual([window.used_percent for window in result.windows], [25, 40])
+        self.assertEqual(result.windows[0].total, 100)
+        self.assertEqual(result.windows[1].resets_at, "2026-11-01T00:00:00Z")
+        request_json.assert_called_once_with(
+            "GET",
+            "https://nano-gpt.com/api/subscription/v1/usage",
+            "test-token",
+            headers={"x-api-key": "test-token"},
+        )
+
+    @patch.dict(os.environ, {"NANOGPT_API_KEY": "test-token"}, clear=False)
+    @patch("api._request_json")
+    def test_nanogpt_legacy_usage_shape(self, request_json):
+        request_json.return_value = {
+            "limits": {"dailyInputTokens": 1000},
+            "dailyInputTokens": {"used": 100, "remaining": 900},
+        }
+
+        result = api.fetch_nanogpt({})
+
+        self.assertEqual(result.windows[0].label, "daily")
+        self.assertEqual(result.windows[0].used_percent, 10)
 
     @patch.dict(os.environ, {"CLAUDE_ACCESS_TOKEN": "test-token"}, clear=False)
     @patch("api._request_json")
@@ -94,6 +153,7 @@ class QuotaParsingTests(unittest.TestCase):
     def test_devpass_credit_windows(self, request_json):
         request_json.return_value = {
             "data": {
+                "devPlan": "pro",
                 "devPlanCreditsUsed": "30",
                 "devPlanCreditsLimit": "100",
                 "devPlanPremiumCreditsUsed": "5",
@@ -104,6 +164,47 @@ class QuotaParsingTests(unittest.TestCase):
         result = api.fetch_devpass({})
 
         self.assertEqual([window.used_percent for window in result.windows], [30, 25])
+        self.assertEqual(result.plan, "pro")
+
+    @patch.dict(
+        os.environ,
+        {
+            "DEVPASS_SESSION_COOKIE": (
+                "__Secure-better-auth.session_token=test-session"
+            )
+        },
+        clear=True,
+    )
+    @patch("api.requests.get")
+    def test_devpass_dashboard_usage(self, get):
+        get.return_value.json.return_value = {
+            "devPlan": "max",
+            "devPlanCreditsUsed": "45",
+            "devPlanCreditsLimit": "300",
+            "devPlanPremiumCreditsUsed": "10",
+            "devPlanPremiumWeeklyLimit": "50",
+            "devPlanPremiumWeekResetsAt": "2026-10-05T12:00:00Z",
+            "devPlanExpiresAt": "2026-11-01T00:00:00Z",
+        }
+
+        result = api.fetch_devpass({})
+
+        self.assertEqual(result.plan, "max")
+        self.assertEqual(
+            [window.label for window in result.windows],
+            ["monthly", "premium weekly"],
+        )
+        self.assertEqual([window.used_percent for window in result.windows], [15, 20])
+        self.assertEqual(result.windows[0].resets_at, "2026-11-01T00:00:00Z")
+        get.assert_called_once_with(
+            api.DEVPASS_STATUS_URL,
+            headers={
+                "Accept": "application/json",
+                "Cookie": "__Secure-better-auth.session_token=test-session",
+                "User-Agent": "howmuch-left/1",
+            },
+            timeout=api.TIMEOUT,
+        )
 
     @patch.dict(os.environ, {"OLLAMA_API_KEY": "test-token"}, clear=False)
     @patch("api._request_json")
@@ -398,7 +499,7 @@ class ConfigTests(unittest.TestCase):
     def test_menu_registers_key_in_private_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            answers = iter(["3", "4", "0"])
+            answers = iter(["2", "3", "0"])
 
             settings = config.menu(
                 path,
@@ -411,10 +512,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings["providers"]["nanogpt"]["token"], "test-key")
             self.assertTrue(settings["providers"]["nanogpt"]["enabled"])
 
-    def test_menu_sets_api_url_and_interval(self):
+    def test_menu_sets_interval_without_api_url_step(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            answers = iter(["1", "5", "https://example.test/usage", "5", "30", "0"])
+            answers = iter(["4", "30", "0"])
 
             settings = config.menu(
                 path,
@@ -422,17 +523,12 @@ class ConfigTests(unittest.TestCase):
                 output_fn=lambda _: None,
             )
 
-            self.assertEqual(
-                settings["providers"]["ollama"]["url"],
-                "https://example.test/usage",
-            )
-            self.assertTrue(settings["providers"]["ollama"]["enabled"])
             self.assertEqual(settings["refresh_interval_seconds"], 30)
 
     def test_menu_runs_oauth_cli(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            answers = iter(["2", "1", "0"])
+            answers = iter(["1", "2", "0"])
             run = Mock(return_value=Mock(returncode=0))
 
             settings = config.menu(
@@ -444,6 +540,25 @@ class ConfigTests(unittest.TestCase):
 
             run.assert_called_once_with(["codex", "login"], check=False)
             self.assertTrue(settings["providers"]["codex"]["enabled"])
+
+    def test_menu_authenticates_copilot_in_browser(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            answers = iter(["1", "1", "0"])
+            run = Mock(return_value=Mock(returncode=0))
+
+            settings = config.menu(
+                path,
+                input_fn=lambda _: next(answers),
+                output_fn=lambda _: None,
+                run_fn=run,
+            )
+
+            run.assert_called_once_with(
+                ["gh", "auth", "login", "--hostname", "github.com", "--web"],
+                check=False,
+            )
+            self.assertTrue(settings["providers"]["copilot"]["enabled"])
 
 
 if __name__ == "__main__":
