@@ -29,6 +29,7 @@ class QuotaResult:
     provider: str
     windows: list[QuotaWindow] = field(default_factory=list)
     error: str | None = None
+    plan: str | None = None
 
 
 def _number(value: Any) -> float | None:
@@ -279,13 +280,128 @@ def fetch_nanogpt(settings: dict) -> QuotaResult:
 
 
 def fetch_ollama(settings: dict) -> QuotaResult:
-    base = str(settings.get("url", "http://localhost:11434")).rstrip("/")
-    data = _request_json("GET", f"{base}/api/ps")
-    count = len(data.get("models", [])) if isinstance(data.get("models"), list) else 0
-    return QuotaResult(
+    return _fetch_cloud_usage(
         "Ollama",
-        [QuotaWindow("local (unlimited)", 0, count, count, "loaded models")],
+        settings,
+        "OLLAMA_API_KEY",
+        "OLLAMA_USAGE_URL",
     )
+
+
+def fetch_antigravity(settings: dict) -> QuotaResult:
+    return _fetch_cloud_usage(
+        "Antigravity",
+        settings,
+        "ANTIGRAVITY_ACCESS_TOKEN",
+        "ANTIGRAVITY_USAGE_URL",
+    )
+
+
+def _fetch_cloud_usage(
+    provider: str,
+    settings: dict,
+    token_env: str,
+    url_env: str,
+) -> QuotaResult:
+    token = _secret(settings, token_env)
+    url = settings.get("url") or os.environ.get(url_env)
+    if not token:
+        return QuotaResult(provider, error=f"set {token_env}")
+    if not url:
+        return QuotaResult(
+            provider,
+            error=f"set {url_env}; this service has no documented quota endpoint",
+        )
+    data = _request_json("GET", str(url), token)
+    plan = _plan_name(data)
+    windows = _quota_windows(data)
+    return QuotaResult(
+        provider,
+        windows,
+        None if windows else "usage endpoint returned no recognized quotas",
+        plan,
+    )
+
+
+def _plan_name(data: dict) -> str | None:
+    plan = data.get("plan") or data.get("tier") or data.get("current_plan")
+    subscription = data.get("subscription")
+    if not plan and isinstance(subscription, dict):
+        plan = subscription.get("plan") or subscription.get("tier") or subscription.get("name")
+    if isinstance(plan, dict):
+        plan = plan.get("name") or plan.get("id") or plan.get("slug")
+    return str(plan) if plan else None
+
+
+def _quota_windows(data: dict) -> list[QuotaWindow]:
+    containers: list[tuple[str, Any]] = []
+    for key in ("windows", "quotas", "limits", "usage"):
+        value = data.get(key)
+        if isinstance(value, (dict, list)):
+            containers.append((key, value))
+    for key in (
+        "five_hour",
+        "fiveHour",
+        "session",
+        "daily",
+        "weekly",
+        "seven_day",
+        "sevenDay",
+        "monthly",
+    ):
+        if isinstance(data.get(key), dict):
+            containers.append((key, data[key]))
+
+    candidates: list[tuple[str, dict]] = []
+    for container_name, container in containers:
+        if isinstance(container, list):
+            for index, value in enumerate(container):
+                if isinstance(value, dict):
+                    candidates.append((str(value.get("label") or value.get("name") or index), value))
+        elif any(
+            key in container
+            for key in ("used", "usage", "total", "limit", "remaining", "percent", "percent_used", "utilization")
+        ):
+            candidates.append((container_name, container))
+        else:
+            candidates.extend(
+                (str(name), value)
+                for name, value in container.items()
+                if isinstance(value, dict)
+            )
+
+    windows = []
+    for fallback_label, value in candidates:
+        label = str(value.get("label") or value.get("name") or fallback_label)
+        label = {
+            "five_hour": "5h",
+            "fiveHour": "5h",
+            "seven_day": "7d",
+            "sevenDay": "7d",
+        }.get(label, label)
+        percent = value.get(
+            "percent_used",
+            value.get("percentUsed", value.get("percent", value.get("utilization"))),
+        )
+        if "utilization" in value:
+            utilization = _number(percent)
+            if utilization is not None and utilization <= 1:
+                percent = utilization * 100
+        window = _window(
+            label,
+            used=value.get("used", value.get("usage")),
+            total=value.get("total", value.get("limit", value.get("entitlement"))),
+            remaining=value.get("remaining", value.get("quota_remaining")),
+            percent=percent,
+            unit=str(value.get("unit", "")),
+            reset=value.get(
+                "resets_at",
+                value.get("reset_at", value.get("resetAt", value.get("next_reset"))),
+            ),
+        )
+        if window:
+            windows.append(window)
+    return windows
 
 
 def fetch_devpass(settings: dict) -> QuotaResult:
@@ -328,6 +444,7 @@ PROVIDERS: dict[str, Callable[[dict], QuotaResult]] = {
     "claude": fetch_claude,
     "nanogpt": fetch_nanogpt,
     "ollama": fetch_ollama,
+    "antigravity": fetch_antigravity,
     "devpass": fetch_devpass,
 }
 

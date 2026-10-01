@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shlex
+import subprocess
 from pathlib import Path
 
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -17,7 +19,8 @@ DEFAULTS = {
         "codex": {"enabled": True},
         "claude": {"enabled": True},
         "nanogpt": {"enabled": False},
-        "ollama": {"enabled": True, "url": "http://localhost:11434"},
+        "ollama": {"enabled": False},
+        "antigravity": {"enabled": False},
         "devpass": {"enabled": False},
     },
 }
@@ -39,3 +42,16 @@ def load(path: Path | None = None) -> dict:
             if isinstance(values, dict):
                 settings["providers"].setdefault(name, {}).update(values)
     return settings
+
+
+def edit(path: Path | None = None) -> None:
+    config_path = path or CONFIG_FILE
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if not config_path.exists():
+        config_path.write_text(
+            json.dumps(DEFAULTS, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    config_path.chmod(0o600)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    subprocess.run([*shlex.split(editor), str(config_path)], check=False)
