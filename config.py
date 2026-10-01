@@ -38,10 +38,8 @@ KEY_NAMES = {
     "claude": "CLAUDE_ACCESS_TOKEN",
     "nanogpt": "NANOGPT_API_KEY",
     "ollama": "OLLAMA_API_KEY",
-    "antigravity": "ANTIGRAVITY_ACCESS_TOKEN",
     "devpass": "DEVPASS_API_KEY",
 }
-
 
 def load(path: Path | None = None) -> dict:
     settings = copy.deepcopy(DEFAULTS)

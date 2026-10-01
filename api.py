@@ -15,11 +15,10 @@ from typing import Any, Callable
 import requests
 
 TIMEOUT = 15
+AGY_TIMEOUT = 45
 OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
 OLLAMA_ACCOUNT_URL = "https://ollama.com/api/me"
 OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
-DEVPASS_DASHBOARD_URL = "https://devpass.llmgateway.io/dashboard/usage"
-DEVPASS_STATUS_URL = "https://api.llmgateway.io/dev-plans/status"
 
 
 @dataclass
@@ -86,7 +85,14 @@ def _request_json(
         method, url, headers=request_headers, timeout=TIMEOUT
     )
     response.raise_for_status()
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        content_type = response.headers.get("Content-Type", "unknown")
+        raise ValueError(
+            f"API returned invalid JSON from {response.url} "
+            f"(HTTP {response.status_code}, Content-Type: {content_type})"
+        ) from exc
     if not isinstance(payload, dict):
         raise ValueError("API returned a non-object response")
     return payload
@@ -338,7 +344,7 @@ def fetch_nanogpt(settings: dict) -> QuotaResult:
         return QuotaResult("NanoGPT", error="set NANOGPT_API_KEY")
     data = _request_json(
         "GET",
-        settings.get("url", "https://nano-gpt.com/api/subscription/v1/usage"),
+        "https://nano-gpt.com/api/subscription/v1/usage",
         token,
         headers={"x-api-key": token},
     )
@@ -548,39 +554,53 @@ def _parse_ollama_settings(document: str) -> tuple[list[QuotaWindow], str | None
     return windows, plan
 
 
-def fetch_antigravity(settings: dict) -> QuotaResult:
-    return _fetch_cloud_usage(
-        "Antigravity",
-        settings,
-        "ANTIGRAVITY_ACCESS_TOKEN",
-        "ANTIGRAVITY_USAGE_URL",
-    )
-
-
-def _fetch_cloud_usage(
-    provider: str,
-    settings: dict,
-    token_env: str,
-    url_env: str,
-) -> QuotaResult:
-    token = _secret(settings, token_env)
-    url = settings.get("url") or os.environ.get(url_env)
-    if not token:
-        return QuotaResult(provider, error=f"set {token_env}")
-    if not url:
-        return QuotaResult(
-            provider,
-            error=f"set {url_env}; this service has no documented quota endpoint",
+def fetch_antigravity(_settings: dict) -> QuotaResult:
+    try:
+        result = subprocess.run(
+            ["agy", "--prompt", "/usage"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=AGY_TIMEOUT,
         )
-    data = _request_json("GET", str(url), token)
-    plan = _plan_name(data)
-    windows = _quota_windows(data)
-    return QuotaResult(
-        provider,
-        windows,
-        None if windows else "usage endpoint returned no recognized quotas",
-        plan,
+    except FileNotFoundError:
+        return QuotaResult("Antigravity", error="agy CLI not found on PATH")
+    except subprocess.TimeoutExpired:
+        return QuotaResult("Antigravity", error="agy --prompt /usage timed out")
+    if result.returncode != 0:
+        return QuotaResult(
+            "Antigravity",
+            error=f"agy exited with status {result.returncode}; check CLI login",
+        )
+
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout)
+    row_pattern = re.compile(
+        r"^\s*(?P<group>.+?)\s+"
+        r"(?P<window>Weekly|Five Hour) Limit Remaining\s+"
+        r"(?P<remaining>\d+(?:\.\d+)?)%\s+(?P<reset>\S+)\s*$",
+        re.IGNORECASE,
     )
+    windows = []
+    for line in output.splitlines():
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        remaining = _number(match.group("remaining"))
+        if remaining is None:
+            continue
+        window = "weekly" if match.group("window").lower() == "weekly" else "5h"
+        windows.append(
+            QuotaWindow(
+                label=f"{match.group('group').strip()} {window}",
+                used_percent=max(0.0, min(100.0, 100.0 - remaining)),
+                resets_at=match.group("reset"),
+            )
+        )
+    if not windows:
+        return QuotaResult(
+            "Antigravity", error="unrecognized output from agy /usage"
+        )
+    return QuotaResult("Antigravity", windows)
 
 
 def _plan_name(data: dict) -> str | None:
@@ -598,103 +618,19 @@ def _plan_name(data: dict) -> str | None:
     return str(plan) if plan else None
 
 
-def _quota_windows(data: dict) -> list[QuotaWindow]:
-    containers: list[tuple[str, Any]] = []
-    for key in ("windows", "quotas", "limits", "usage"):
-        value = data.get(key)
-        if isinstance(value, (dict, list)):
-            containers.append((key, value))
-    for key in (
-        "five_hour",
-        "fiveHour",
-        "session",
-        "daily",
-        "weekly",
-        "seven_day",
-        "sevenDay",
-        "monthly",
-    ):
-        if isinstance(data.get(key), dict):
-            containers.append((key, data[key]))
-
-    candidates: list[tuple[str, dict]] = []
-    for container_name, container in containers:
-        if isinstance(container, list):
-            for index, value in enumerate(container):
-                if isinstance(value, dict):
-                    candidates.append((str(value.get("label") or value.get("name") or index), value))
-        elif any(
-            key in container
-            for key in ("used", "usage", "total", "limit", "remaining", "percent", "percent_used", "utilization")
-        ):
-            candidates.append((container_name, container))
-        else:
-            candidates.extend(
-                (str(name), value)
-                for name, value in container.items()
-                if isinstance(value, dict)
-            )
-
-    windows = []
-    for fallback_label, value in candidates:
-        label = str(value.get("label") or value.get("name") or fallback_label)
-        label = {
-            "five_hour": "5h",
-            "fiveHour": "5h",
-            "seven_day": "7d",
-            "sevenDay": "7d",
-        }.get(label, label)
-        percent = value.get(
-            "percent_used",
-            value.get("percentUsed", value.get("percent", value.get("utilization"))),
-        )
-        if "utilization" in value:
-            utilization = _number(percent)
-            if utilization is not None and utilization <= 1:
-                percent = utilization * 100
-        window = _window(
-            label,
-            used=value.get("used", value.get("usage")),
-            total=value.get("total", value.get("limit", value.get("entitlement"))),
-            remaining=value.get("remaining", value.get("quota_remaining")),
-            percent=percent,
-            unit=str(value.get("unit", "")),
-            reset=value.get(
-                "resets_at",
-                value.get("reset_at", value.get("resetAt", value.get("next_reset"))),
-            ),
-        )
-        if window:
-            windows.append(window)
-    return windows
-
-
 def fetch_devpass(settings: dict) -> QuotaResult:
     token = _secret(settings, "DEVPASS_API_KEY")
-    session_cookie = settings.get("session_cookie") or os.environ.get(
-        "DEVPASS_SESSION_COOKIE"
-    )
-    if session_cookie:
-        response = requests.get(
-            DEVPASS_STATUS_URL,
-            headers={
-                "Accept": "application/json",
-                "Cookie": str(session_cookie),
-                "User-Agent": "howmuch-left/1",
-            },
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("dashboard returned a non-object response")
-    elif token:
+    if token:
         payload = _request_json(
-            "GET", settings.get("url", "https://api.llmgateway.io/v1/key"), token
+            "GET", "https://api.llmgateway.io/v1/key", token
         )
     else:
         return QuotaResult(
-            "DevPass", error="set DEVPASS_API_KEY or DEVPASS_SESSION_COOKIE"
+            "DevPass",
+            error=(
+                "set DEVPASS_API_KEY "
+                "(dashboard session cookies are not supported)"
+            ),
         )
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     windows = []

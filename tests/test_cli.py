@@ -169,22 +169,25 @@ class QuotaParsingTests(unittest.TestCase):
     @patch.dict(
         os.environ,
         {
+            "DEVPASS_API_KEY": "test-api-key",
             "DEVPASS_SESSION_COOKIE": (
                 "__Secure-better-auth.session_token=test-session"
             )
         },
         clear=True,
     )
-    @patch("api.requests.get")
-    def test_devpass_dashboard_usage(self, get):
-        get.return_value.json.return_value = {
-            "devPlan": "max",
-            "devPlanCreditsUsed": "45",
-            "devPlanCreditsLimit": "300",
-            "devPlanPremiumCreditsUsed": "10",
-            "devPlanPremiumWeeklyLimit": "50",
-            "devPlanPremiumWeekResetsAt": "2026-10-05T12:00:00Z",
-            "devPlanExpiresAt": "2026-11-01T00:00:00Z",
+    @patch("api._request_json")
+    def test_devpass_api_key_takes_precedence_over_session_cookie(self, request_json):
+        request_json.return_value = {
+            "data": {
+                "devPlan": "max",
+                "devPlanCreditsUsed": "45",
+                "devPlanCreditsLimit": "300",
+                "devPlanPremiumCreditsUsed": "10",
+                "devPlanPremiumWeeklyLimit": "50",
+                "devPlanPremiumWeekResetsAt": "2026-10-05T12:00:00Z",
+                "devPlanExpiresAt": "2026-11-01T00:00:00Z",
+            }
         }
 
         result = api.fetch_devpass({})
@@ -196,14 +199,8 @@ class QuotaParsingTests(unittest.TestCase):
         )
         self.assertEqual([window.used_percent for window in result.windows], [15, 20])
         self.assertEqual(result.windows[0].resets_at, "2026-11-01T00:00:00Z")
-        get.assert_called_once_with(
-            api.DEVPASS_STATUS_URL,
-            headers={
-                "Accept": "application/json",
-                "Cookie": "__Secure-better-auth.session_token=test-session",
-                "User-Agent": "howmuch-left/1",
-            },
-            timeout=api.TIMEOUT,
+        request_json.assert_called_once_with(
+            "GET", "https://api.llmgateway.io/v1/key", "test-api-key"
         )
 
     @patch.dict(os.environ, {"OLLAMA_API_KEY": "test-token"}, clear=False)
@@ -383,30 +380,39 @@ class QuotaParsingTests(unittest.TestCase):
 
         self.assertEqual(windows[0].resets_at, "2026-10-08T00:00:00Z")
 
-    @patch.dict(
-        os.environ, {"ANTIGRAVITY_ACCESS_TOKEN": "test-token"}, clear=False
-    )
-    @patch("api._request_json")
-    def test_antigravity_quota_list(self, request_json):
-        request_json.return_value = {
-            "tier": "Ultra",
-            "quotas": [
-                {
-                    "name": "weekly",
-                    "remaining": 75,
-                    "total": 100,
-                    "next_reset": "Friday",
-                }
+    @patch("api.subprocess.run")
+    def test_antigravity_cli_usage(self, run):
+        run.return_value = Mock(
+            returncode=0,
+            stdout=(
+                "Quota:\n"
+                "Gemini Models          Weekly Limit Remaining     100%  2026-10-08T09:41:32Z\n"
+                "Gemini Models          Five Hour Limit Remaining  98%   2026-10-01T14:41:32Z\n"
+                "Claude and GPT models  Weekly Limit Remaining     80%   2026-10-08T09:50:08Z\n"
+                "Claude and GPT models  Five Hour Limit Remaining  50%   2026-10-01T14:50:08Z\n"
+            ),
+        )
+
+        result = api.fetch_antigravity({})
+
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            [window.label for window in result.windows],
+            [
+                "Gemini Models weekly",
+                "Gemini Models 5h",
+                "Claude and GPT models weekly",
+                "Claude and GPT models 5h",
             ],
-        }
-
-        result = api.fetch_antigravity({"url": "https://example.test/quota"})
-
-        self.assertEqual(result.plan, "Ultra")
-        self.assertEqual(result.windows[0].used_percent, 25)
-        self.assertEqual(result.windows[0].resets_at, "Friday")
+        )
+        self.assertEqual(
+            [window.used_percent for window in result.windows],
+            [0.0, 2.0, 20.0, 50.0],
+        )
+        self.assertEqual(result.windows[0].resets_at, "2026-10-08T09:41:32Z")
 
     @patch.dict(os.environ, {}, clear=True)
+
     def test_cloud_provider_requires_credentials(self):
         result = api.fetch_ollama({})
 
