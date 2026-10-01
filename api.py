@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +14,8 @@ from typing import Any, Callable
 import requests
 
 TIMEOUT = 15
+OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
+OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
 
 
 @dataclass
@@ -344,12 +348,111 @@ def fetch_nanogpt(settings: dict) -> QuotaResult:
 
 
 def fetch_ollama(settings: dict) -> QuotaResult:
-    return _fetch_cloud_usage(
+    token = _secret(settings, "OLLAMA_API_KEY")
+    cookie = settings.get("session_cookie") or os.environ.get("OLLAMA_SESSION_COOKIE")
+    if token:
+        try:
+            data = _request_json("GET", OLLAMA_USAGE_URL, token)
+            windows = _ollama_usage_windows(data)
+            if windows:
+                return QuotaResult("Ollama", windows, plan=_plan_name(data))
+        except requests.RequestException:
+            if not cookie:
+                raise
+    if cookie:
+        response = requests.get(
+            OLLAMA_SETTINGS_URL,
+            headers={
+                "Accept": "text/html",
+                "Cookie": str(cookie),
+                "User-Agent": "howmuch-left/1",
+            },
+            timeout=TIMEOUT,
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+        if response.is_redirect:
+            return QuotaResult("Ollama", error="Ollama session cookie expired")
+        windows, plan = _parse_ollama_settings(response.text)
+        return QuotaResult(
+            "Ollama",
+            windows,
+            None if windows else "settings page returned no recognized quotas",
+            plan,
+        )
+    return QuotaResult(
         "Ollama",
-        settings,
-        "OLLAMA_API_KEY",
-        "OLLAMA_USAGE_URL",
+        error="set OLLAMA_API_KEY or OLLAMA_SESSION_COOKIE",
     )
+
+
+def _ollama_usage_windows(data: dict) -> list[QuotaWindow]:
+    limits = data.get("limits")
+    if not isinstance(limits, dict):
+        return []
+    windows = []
+    for name, label in (
+        ("session", "5h"),
+        ("weekly", "weekly"),
+        ("monthly", "monthly"),
+    ):
+        value = limits.get(name)
+        if not isinstance(value, dict):
+            continue
+        usage = _number(value.get("usage"))
+        if usage is not None and 0 <= usage <= 1:
+            usage *= 100
+        window = _window(
+            label,
+            percent=usage,
+            reset=value.get("resets_at", value.get("reset_at")),
+        )
+        if window:
+            windows.append(window)
+    return windows
+
+
+def _parse_ollama_settings(document: str) -> tuple[list[QuotaWindow], str | None]:
+    text = html.unescape(document)
+    windows = []
+    labels = (
+        ("5h", ("5-hour", "5h", "Session", "Hourly")),
+        ("weekly", ("Weekly",)),
+    )
+    reset_times = re.findall(r'data-time=["\']([^"\']+)', text, re.IGNORECASE)
+    for index, (label, names) in enumerate(labels):
+        percent = None
+        for name in names:
+            patterns = (
+                rf'aria-label=["\']{re.escape(name)}\s+usage\s+([\d.]+)\s*%',
+                rf'{re.escape(name)}\s+usage[\s\S]{{0,400}}?([\d.]+)\s*%\s*used',
+                rf'{re.escape(name)}\s+usage[\s\S]{{0,400}}?width:\s*([\d.]+)%',
+            )
+            match = next(
+                (
+                    found
+                    for pattern in patterns
+                    if (found := re.search(pattern, text, re.IGNORECASE))
+                ),
+                None,
+            )
+            if match:
+                percent = match.group(1)
+                break
+        window = _window(
+            label,
+            percent=percent,
+            reset=reset_times[index] if index < len(reset_times) else None,
+        )
+        if window:
+            windows.append(window)
+    plan_match = re.search(
+        r"Cloud\s+Usage[\s\S]{0,300}?\b(Free|Pro|Max|Business)\b",
+        text,
+        re.IGNORECASE,
+    )
+    plan = plan_match.group(1).title() if plan_match else None
+    return windows, plan
 
 
 def fetch_antigravity(settings: dict) -> QuotaResult:

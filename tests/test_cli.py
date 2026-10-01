@@ -107,24 +107,58 @@ class QuotaParsingTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"OLLAMA_API_KEY": "test-token"}, clear=False)
     @patch("api._request_json")
-    def test_ollama_cloud_plan_windows_and_resets(self, request_json):
+    def test_ollama_cloud_usage_api(self, request_json):
         request_json.return_value = {
-            "subscription": {"plan": "Pro"},
-            "windows": {
-                "five_hour": {
-                    "used": 25,
-                    "limit": 100,
-                    "resets_at": "2026-10-01T10:00:00Z",
-                },
-                "weekly": {"percent_used": 40, "reset_at": "next week"},
+            "plan": "Pro",
+            "limits": {
+                "session": {"usage": 0.25},
+                "weekly": {"usage": 0.4},
+                "monthly": {"usage": 0.1},
             },
         }
 
-        result = api.fetch_ollama({"url": "https://example.test/usage"})
+        result = api.fetch_ollama({})
 
         self.assertEqual(result.plan, "Pro")
-        self.assertEqual([window.label for window in result.windows], ["5h", "weekly"])
-        self.assertEqual(result.windows[0].resets_at, "2026-10-01T10:00:00Z")
+        self.assertEqual(
+            [window.label for window in result.windows], ["5h", "weekly", "monthly"]
+        )
+        self.assertEqual(
+            [window.used_percent for window in result.windows], [25, 40, 10]
+        )
+
+    @patch.dict(
+        os.environ,
+        {"OLLAMA_SESSION_COOKIE": "__Secure-session=test"},
+        clear=True,
+    )
+    @patch("api.requests.get")
+    def test_ollama_settings_cookie_fallback(self, get):
+        get.return_value.status_code = 200
+        get.return_value.is_redirect = False
+        get.return_value.text = """
+            <span>Cloud Usage</span><span>Pro</span>
+            <div aria-label="Session usage 18%"></div>
+            <div class="local-time" data-time="2026-10-01T10:00:00Z"></div>
+            <span>Weekly usage</span><span>67% used</span>
+            <div class="local-time" data-time="2026-10-04T13:00:00Z"></div>
+        """
+
+        result = api.fetch_ollama({})
+
+        self.assertEqual(result.plan, "Pro")
+        self.assertEqual([window.used_percent for window in result.windows], [18, 67])
+        self.assertEqual(result.windows[1].resets_at, "2026-10-04T13:00:00Z")
+        get.assert_called_once_with(
+            api.OLLAMA_SETTINGS_URL,
+            headers={
+                "Accept": "text/html",
+                "Cookie": "__Secure-session=test",
+                "User-Agent": "howmuch-left/1",
+            },
+            timeout=api.TIMEOUT,
+            allow_redirects=False,
+        )
 
     @patch.dict(
         os.environ, {"ANTIGRAVITY_ACCESS_TOKEN": "test-token"}, clear=False
@@ -153,7 +187,9 @@ class QuotaParsingTests(unittest.TestCase):
     def test_cloud_provider_requires_credentials(self):
         result = api.fetch_ollama({})
 
-        self.assertEqual(result.error, "set OLLAMA_API_KEY")
+        self.assertEqual(
+            result.error, "set OLLAMA_API_KEY or OLLAMA_SESSION_COOKIE"
+        )
 
     @patch("api.requests.post")
     def test_codex_refresh_rotates_and_secures_credentials(self, post):
