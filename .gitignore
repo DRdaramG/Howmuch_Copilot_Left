@@ -17,8 +17,18 @@ build/
 # Installer output
 Output/
 
-# Runtime config (user-specific, contains API key)
+# Runtime config and secrets (user-specific, contains API key / session)
 CopilotLeft/
+config.json
+.env
+.env.*
+*.env
+*.key
+*.token
+*.cookie
+*credentials*.json
+auth*.json
+howmuch-left.json
 
 # IDE
 .vscode/
