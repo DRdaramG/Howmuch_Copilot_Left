@@ -18,6 +18,8 @@ TIMEOUT = 15
 OLLAMA_USAGE_URL = "https://ollama.com/api/usage"
 OLLAMA_ACCOUNT_URL = "https://ollama.com/api/me"
 OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
+DEVPASS_DASHBOARD_URL = "https://devpass.llmgateway.io/dashboard/usage"
+DEVPASS_STATUS_URL = "https://api.llmgateway.io/dev-plans/status"
 
 
 @dataclass
@@ -669,15 +671,40 @@ def _quota_windows(data: dict) -> list[QuotaWindow]:
 
 def fetch_devpass(settings: dict) -> QuotaResult:
     token = _secret(settings, "DEVPASS_API_KEY")
-    if not token:
-        return QuotaResult("DevPass", error="set DEVPASS_API_KEY")
-    payload = _request_json(
-        "GET", settings.get("url", "https://api.llmgateway.io/v1/key"), token
+    session_cookie = settings.get("session_cookie") or os.environ.get(
+        "DEVPASS_SESSION_COOKIE"
     )
+    if session_cookie:
+        response = requests.get(
+            DEVPASS_STATUS_URL,
+            headers={
+                "Accept": "application/json",
+                "Cookie": str(session_cookie),
+                "User-Agent": "howmuch-left/1",
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("dashboard returned a non-object response")
+    elif token:
+        payload = _request_json(
+            "GET", settings.get("url", "https://api.llmgateway.io/v1/key"), token
+        )
+    else:
+        return QuotaResult(
+            "DevPass", error="set DEVPASS_API_KEY or DEVPASS_SESSION_COOKIE"
+        )
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     windows = []
     for label, used_key, limit_key, reset_key in (
-        ("credits", "devPlanCreditsUsed", "devPlanCreditsLimit", None),
+        (
+            "monthly",
+            "devPlanCreditsUsed",
+            "devPlanCreditsLimit",
+            "devPlanExpiresAt",
+        ),
         (
             "premium weekly",
             "devPlanPremiumCreditsUsed",
@@ -698,7 +725,13 @@ def fetch_devpass(settings: dict) -> QuotaResult:
         window = _window("usage", used=data.get("usage"), total=data.get("limit"))
         if window:
             windows.append(window)
-    return QuotaResult("DevPass", windows, None if windows else "unknown usage format")
+    plan = data.get("devPlan")
+    return QuotaResult(
+        "DevPass",
+        windows,
+        None if windows else "unknown usage format",
+        str(plan) if plan and plan != "none" else None,
+    )
 
 
 PROVIDERS: dict[str, Callable[[dict], QuotaResult]] = {

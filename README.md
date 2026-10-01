@@ -64,7 +64,7 @@ python main.py --no-clear
 | NanoGPT | `NANOGPT_API_KEY` |
 | Ollama Cloud | `OLLAMA_API_KEY`, 또는 `OLLAMA_SESSION_COOKIE` |
 | Antigravity | `ANTIGRAVITY_ACCESS_TOKEN` |
-| DevPass | `DEVPASS_API_KEY` |
+| DevPass | `DEVPASS_API_KEY`, 또는 `DEVPASS_SESSION_COOKIE` |
 
 예:
 
@@ -113,6 +113,12 @@ API 키를 사용할 수 없으면 브라우저 개발자 도구에서 `ollama.c
 Antigravity는 계정에 제공된 할당량 API 또는 호환 프록시 주소를
 `ANTIGRAVITY_USAGE_URL`(또는 설정의 `url`)로 지정해야 합니다. 응답의 요금제와
 5시간·일간·주간·월간 한도 및 초기화 시각을 인식해 표시합니다.
+
+DevPass는 API 키로 공식 `GET /v1/key` 사용량 API를 조회합니다. 또는
+`https://devpass.llmgateway.io/dashboard/usage`에 로그인한 브라우저의
+`better-auth.session_token` 쿠키 전체 값을 `DEVPASS_SESSION_COOKIE`로 지정하면
+대시보드가 사용하는 상태 API에서 월간 및 프리미엄 주간 사용량을 읽습니다. 세션
+쿠키는 비밀번호처럼 취급하고 환경 변수로만 전달하는 것을 권장합니다.
 
 ## 테스트
 

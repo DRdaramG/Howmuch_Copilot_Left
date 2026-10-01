@@ -153,6 +153,7 @@ class QuotaParsingTests(unittest.TestCase):
     def test_devpass_credit_windows(self, request_json):
         request_json.return_value = {
             "data": {
+                "devPlan": "pro",
                 "devPlanCreditsUsed": "30",
                 "devPlanCreditsLimit": "100",
                 "devPlanPremiumCreditsUsed": "5",
@@ -163,6 +164,47 @@ class QuotaParsingTests(unittest.TestCase):
         result = api.fetch_devpass({})
 
         self.assertEqual([window.used_percent for window in result.windows], [30, 25])
+        self.assertEqual(result.plan, "pro")
+
+    @patch.dict(
+        os.environ,
+        {
+            "DEVPASS_SESSION_COOKIE": (
+                "__Secure-better-auth.session_token=test-session"
+            )
+        },
+        clear=True,
+    )
+    @patch("api.requests.get")
+    def test_devpass_dashboard_usage(self, get):
+        get.return_value.json.return_value = {
+            "devPlan": "max",
+            "devPlanCreditsUsed": "45",
+            "devPlanCreditsLimit": "300",
+            "devPlanPremiumCreditsUsed": "10",
+            "devPlanPremiumWeeklyLimit": "50",
+            "devPlanPremiumWeekResetsAt": "2026-10-05T12:00:00Z",
+            "devPlanExpiresAt": "2026-11-01T00:00:00Z",
+        }
+
+        result = api.fetch_devpass({})
+
+        self.assertEqual(result.plan, "max")
+        self.assertEqual(
+            [window.label for window in result.windows],
+            ["monthly", "premium weekly"],
+        )
+        self.assertEqual([window.used_percent for window in result.windows], [15, 20])
+        self.assertEqual(result.windows[0].resets_at, "2026-11-01T00:00:00Z")
+        get.assert_called_once_with(
+            api.DEVPASS_STATUS_URL,
+            headers={
+                "Accept": "application/json",
+                "Cookie": "__Secure-better-auth.session_token=test-session",
+                "User-Agent": "howmuch-left/1",
+            },
+            timeout=api.TIMEOUT,
+        )
 
     @patch.dict(os.environ, {"OLLAMA_API_KEY": "test-token"}, clear=False)
     @patch("api._request_json")
